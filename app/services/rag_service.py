@@ -8,6 +8,11 @@ from app.schemas.chat import (
     RetrievedChunkDebugItem,
 )
 from app.schemas.retrieval import RetrievalSearchItem
+from app.services.conversation_service import (
+    get_owned_knowledge_base,
+    resolve_conversation_for_question,
+    save_message,
+)
 from app.services.retrieval import search_chunks
 from app.utils.llm_client import generate_answer
 
@@ -23,10 +28,28 @@ def ask_knowledge_base(
     question: str,
     top_k: int = 3,
     debug: bool = False,
+    conversation_id: int | None = None,
 ) -> ChatAskResponse:
     normalized_question = question.strip()
     if not normalized_question:
         raise HTTPException(status_code=400, detail="Question cannot be blank")
+
+    get_owned_knowledge_base(db, knowledge_base_id, current_user_id)
+    conversation = resolve_conversation_for_question(
+        db=db,
+        current_user_id=current_user_id,
+        knowledge_base_id=knowledge_base_id,
+        question=normalized_question,
+        conversation_id=conversation_id,
+    )
+
+    # 先保存用户问题，这样即使后续检索结果为空，也能恢复完整会话历史。
+    save_message(
+        db=db,
+        conversation=conversation,
+        role="user",
+        content=normalized_question,
+    )
 
     retrieved_chunks = search_chunks(
         db=db,
@@ -37,25 +60,31 @@ def ask_knowledge_base(
     )
 
     if not retrieved_chunks or retrieved_chunks[0].score < RELEVANCE_SCORE_THRESHOLD:
-        return ChatAskResponse(
-            answer=NO_ANSWER_MESSAGE,
-            citations=[],
-            retrieved_chunks=_build_debug_items(retrieved_chunks) if debug else None,
+        assistant_message = NO_ANSWER_MESSAGE
+        citations: list[ChatCitationItem] = []
+    else:
+        source_mapping = _build_source_mapping(retrieved_chunks)
+        assistant_message = generate_answer(
+            system_prompt=_build_system_prompt(),
+            user_prompt=_build_user_prompt(normalized_question, source_mapping),
         )
 
-    source_mapping = _build_source_mapping(retrieved_chunks)
-    answer = generate_answer(
-        system_prompt=_build_system_prompt(),
-        user_prompt=_build_user_prompt(normalized_question, source_mapping),
+        cited_source_ids = _parse_cited_source_ids(assistant_message)
+        citations = _build_citations(source_mapping, cited_source_ids)
+        if not citations:
+            citations = _build_fallback_citations(retrieved_chunks)
+
+    save_message(
+        db=db,
+        conversation=conversation,
+        role="assistant",
+        content=assistant_message,
+        citations_json=[citation.model_dump() for citation in citations] or None,
     )
 
-    cited_source_ids = _parse_cited_source_ids(answer)
-    citations = _build_citations(source_mapping, cited_source_ids)
-    if not citations:
-        citations = _build_fallback_citations(retrieved_chunks)
-
     return ChatAskResponse(
-        answer=answer,
+        conversation_id=conversation.id,
+        answer=assistant_message,
         citations=citations,
         retrieved_chunks=_build_debug_items(retrieved_chunks) if debug else None,
     )
@@ -95,10 +124,7 @@ def _build_user_prompt(question: str, source_mapping: dict[str, RetrievalSearchI
 
 
 def _build_source_mapping(retrieved_chunks: list[RetrievalSearchItem]) -> dict[str, RetrievalSearchItem]:
-    return {
-        f"S{index + 1}": item
-        for index, item in enumerate(retrieved_chunks)
-    }
+    return {f"S{index + 1}": item for index, item in enumerate(retrieved_chunks)}
 
 
 def _parse_cited_source_ids(answer: str) -> list[str]:

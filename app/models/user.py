@@ -19,3 +19,4 @@ class User(Base):
 
     # relationship 不会直接在表里生成字段，它描述的是表之间的对象关系。
     knowledge_bases = relationship("KnowledgeBase", back_populates="user")
+    conversations = relationship("Conversation", back_populates="user")

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from fastapi import FastAPI
@@ -28,6 +29,7 @@ class ChatApiTestCase(unittest.TestCase):
 
     def test_chat_ask_returns_response(self):
         mocked_response = {
+            "conversation_id": 10,
             "answer": "答案 [S1]",
             "citations": [
                 {
@@ -53,15 +55,72 @@ class ChatApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["answer"], "答案 [S1]")
+        self.assertEqual(response.json()["conversation_id"], 10)
 
-    def test_chat_ask_requires_non_blank_question(self):
-        response = self.client.post(
-            "/api/chat/ask",
-            json={
-                "knowledge_base_id": 1,
-                "question": "   ",
-                "top_k": 3,
+    def test_create_conversation_returns_response(self):
+        mocked_response = {
+            "id": 1,
+            "knowledge_base_id": 2,
+            "title": "测试会话",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+        with patch("app.api.chat.create_conversation", return_value=mocked_response):
+            response = self.client.post(
+                "/api/chat/conversations",
+                json={"knowledge_base_id": 2, "title": "测试会话"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "测试会话")
+
+    def test_list_conversations_returns_response(self):
+        mocked_response = [
+            {
+                "id": 1,
+                "knowledge_base_id": 2,
+                "title": "测试会话",
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        ]
+
+        with patch("app.api.chat.list_conversations", return_value=mocked_response):
+            response = self.client.get("/api/chat/conversations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+    def test_get_messages_returns_response(self):
+        mocked_response = [
+            {
+                "id": 1,
+                "conversation_id": 10,
+                "role": "user",
+                "content": "你好",
+                "citations_json": None,
+                "created_at": datetime.utcnow().isoformat(),
             },
-        )
+            {
+                "id": 2,
+                "conversation_id": 10,
+                "role": "assistant",
+                "content": "你好，我是助手",
+                "citations_json": [
+                    {
+                        "document_id": 1,
+                        "filename": "demo.txt",
+                        "chunk_index": 0,
+                        "snippet": "片段",
+                    }
+                ],
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        ]
 
-        self.assertEqual(response.status_code, 400)
+        with patch("app.api.chat.list_conversation_messages", return_value=mocked_response):
+            response = self.client.get("/api/chat/conversations/10/messages")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 2)

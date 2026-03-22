@@ -23,3 +23,4 @@ class KnowledgeBase(Base):
     # 这让我们可以通过 kb.user 反向拿到所属用户。
     user = relationship("User", back_populates="knowledge_bases")
     documents = relationship("Document", back_populates="knowledge_base")
+    conversations = relationship("Conversation", back_populates="knowledge_base")

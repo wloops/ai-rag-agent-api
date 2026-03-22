@@ -6,6 +6,7 @@ class ChatAskRequest(BaseModel):
     question: str
     top_k: int = Field(default=3, ge=1)
     debug: bool = False
+    conversation_id: int | None = None
 
 
 class ChatCitationItem(BaseModel):
@@ -25,6 +26,7 @@ class RetrievedChunkDebugItem(BaseModel):
 
 
 class ChatAskResponse(BaseModel):
+    conversation_id: int
     answer: str
     citations: list[ChatCitationItem]
     retrieved_chunks: list[RetrievedChunkDebugItem] | None = None

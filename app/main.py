@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.auth import router as auth_router
+from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.kb import router as kb_router
 from app.api.retrieval import router as retrieval_router
@@ -58,3 +59,4 @@ app.include_router(auth_router)
 app.include_router(kb_router)
 app.include_router(documents_router)
 app.include_router(retrieval_router)
+app.include_router(chat_router)

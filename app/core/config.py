@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = "glm-4.5-air"
 
     # env_file=".env" 表示优先从项目根目录的 .env 加载配置。
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

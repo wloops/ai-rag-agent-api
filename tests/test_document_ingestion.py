@@ -3,6 +3,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import UploadFile
 from sqlalchemy import create_engine
@@ -56,7 +57,17 @@ class DocumentIngestionTestCase(unittest.TestCase):
         self.engine.dispose()
 
     def test_persist_document_chunks_success(self):
-        persist_document_chunks(self.db, self.document, "abcdefghij", chunk_size=4, overlap=1)
+        with patch(
+            "app.services.document_ingestion.embed_texts",
+            return_value=[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+        ):
+            persist_document_chunks(
+                self.db,
+                self.document,
+                "abcdefghij",
+                chunk_size=4,
+                overlap=1,
+            )
 
         chunks = (
             self.db.query(Chunk)
@@ -69,13 +80,23 @@ class DocumentIngestionTestCase(unittest.TestCase):
         self.assertEqual(self.document.status, "success")
         self.assertEqual([chunk.chunk_index for chunk in chunks], [0, 1, 2])
         self.assertEqual(chunks[0].content, "abcd")
+        self.assertEqual(chunks[0].embedding, [0.1, 0.2])
         self.assertEqual(
             chunks[0].metadata_json,
             {"start_char": 0, "end_char": 4, "chunk_size": 4, "overlap": 1},
         )
 
     def test_persist_document_chunks_marks_document_failed_when_split_fails(self):
-        persist_document_chunks(self.db, self.document, "abcdefghij", chunk_size=4, overlap=4)
+        with patch("app.services.document_ingestion.embed_texts") as mocked_embed_texts:
+            persist_document_chunks(
+                self.db,
+                self.document,
+                "abcdefghij",
+                chunk_size=4,
+                overlap=4,
+            )
+
+        mocked_embed_texts.assert_not_called()
 
         chunks = self.db.query(Chunk).filter(Chunk.document_id == self.document.id).all()
         self.db.refresh(self.document)
@@ -93,17 +114,21 @@ class DocumentIngestionTestCase(unittest.TestCase):
                 file=io.BytesIO(raw_text.encode("utf-8")),
             )
 
-            asyncio.run(
-                ingest_document_file(
-                    self.db,
-                    self.document,
-                    upload_file,
-                    storage_path=Path(temp_dir) / "dirty.txt",
-                    file_type="txt",
-                    chunk_size=100,
-                    overlap=10,
+            with patch(
+                "app.services.document_ingestion.embed_texts",
+                return_value=[[0.1, 0.2, 0.3]],
+            ):
+                asyncio.run(
+                    ingest_document_file(
+                        self.db,
+                        self.document,
+                        upload_file,
+                        storage_path=Path(temp_dir) / "dirty.txt",
+                        file_type="txt",
+                        chunk_size=100,
+                        overlap=10,
+                    )
                 )
-            )
 
         chunks = (
             self.db.query(Chunk)
@@ -116,6 +141,7 @@ class DocumentIngestionTestCase(unittest.TestCase):
         self.assertEqual(self.document.status, "success")
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].content, "line1 value\n\nline2 end")
+        self.assertEqual(chunks[0].embedding, [0.1, 0.2, 0.3])
         self.assertNotIn("\u0001", chunks[0].content)
         self.assertNotIn("\t", chunks[0].content)
         self.assertNotIn("\u200b", chunks[0].content)
@@ -129,22 +155,45 @@ class DocumentIngestionTestCase(unittest.TestCase):
                 file=io.BytesIO(raw_text.encode("utf-8")),
             )
 
-            asyncio.run(
-                ingest_document_file(
-                    self.db,
-                    self.document,
-                    upload_file,
-                    storage_path=Path(temp_dir) / "empty.txt",
-                    file_type="txt",
-                    chunk_size=100,
-                    overlap=10,
+            with patch("app.services.document_ingestion.embed_texts") as mocked_embed_texts:
+                asyncio.run(
+                    ingest_document_file(
+                        self.db,
+                        self.document,
+                        upload_file,
+                        storage_path=Path(temp_dir) / "empty.txt",
+                        file_type="txt",
+                        chunk_size=100,
+                        overlap=10,
+                    )
                 )
-            )
+
+        mocked_embed_texts.assert_not_called()
 
         chunks = self.db.query(Chunk).filter(Chunk.document_id == self.document.id).all()
         self.db.refresh(self.document)
 
         self.assertEqual(self.document.status, "success")
+        self.assertEqual(chunks, [])
+
+    def test_persist_document_chunks_marks_document_failed_when_embedding_fails(self):
+        with patch(
+            "app.services.document_ingestion.embed_texts",
+            side_effect=RuntimeError("embedding failed"),
+        ):
+            persist_document_chunks(
+                self.db,
+                self.document,
+                "abcdefghij",
+                chunk_size=4,
+                overlap=1,
+            )
+
+        chunks = self.db.query(Chunk).filter(Chunk.document_id == self.document.id).all()
+        self.db.refresh(self.document)
+
+        self.assertEqual(self.document.status, "failed")
+        self.assertIn("embedding failed", self.document.error_message)
         self.assertEqual(chunks, [])
 
 

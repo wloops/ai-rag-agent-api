@@ -1,12 +1,14 @@
-﻿import logging
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.auth import router as auth_router
 from app.api.documents import router as documents_router
 from app.api.kb import router as kb_router
+from app.api.retrieval import router as retrieval_router
 from app.core.database import Base, engine
 
 # 确保模型已导入，这样 create_all 才知道需要创建哪些表。
@@ -36,6 +38,10 @@ def on_startup():
     # 项目启动时尝试创建表。
     # 对新手来说可以先这样快速跑通；正式项目通常会改成 Alembic 迁移。
     try:
+        if engine.dialect.name == "postgresql":
+            # pgvector 是后续向量检索的基础扩展，这里在建表前确保数据库具备该能力。
+            with engine.begin() as connection:
+                connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         Base.metadata.create_all(bind=engine)
     except SQLAlchemyError:
         logger.exception("Database initialization failed during startup")
@@ -51,3 +57,4 @@ def health():
 app.include_router(auth_router)
 app.include_router(kb_router)
 app.include_router(documents_router)
+app.include_router(retrieval_router)

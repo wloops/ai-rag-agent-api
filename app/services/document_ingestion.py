@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
 from app.models.document import Document
+from app.utils.embeddings import embed_texts
 from app.utils.file_parser import parse_file
 from app.utils.text_cleaner import clean_text
 from app.utils.text_splitter import iter_chunk_ranges
@@ -68,7 +69,22 @@ def persist_document_chunks(
 ) -> Document:
     try:
         chunk_ranges = iter_chunk_ranges(text, chunk_size=chunk_size, overlap=overlap)
-        chunks = _build_chunks(document.id, text, chunk_ranges, chunk_size, overlap)
+        chunk_contents = [text[start:end] for start, end in chunk_ranges]
+
+        if chunk_contents:
+            # chunk 的 embedding 在入库前统一生成，避免查询时临时计算带来额外延迟和成本。
+            embeddings = embed_texts(chunk_contents)
+        else:
+            embeddings = []
+
+        chunks = _build_chunks(
+            document.id,
+            text,
+            chunk_ranges,
+            embeddings,
+            chunk_size,
+            overlap,
+        )
 
         # chunk 入库和文档成功状态放在同一次提交里，避免出现 success 但 chunk 不完整。
         db.add_all(chunks)
@@ -99,6 +115,7 @@ def _build_chunks(
     document_id: int,
     text: str,
     chunk_ranges: list[tuple[int, int]],
+    embeddings: list[list[float]],
     chunk_size: int,
     overlap: int,
 ) -> list[Chunk]:
@@ -106,6 +123,7 @@ def _build_chunks(
 
     for chunk_index, (start, end) in enumerate(chunk_ranges):
         content = text[start:end]
+        embedding = embeddings[chunk_index] if chunk_index < len(embeddings) else None
         chunks.append(
             Chunk(
                 document_id=document_id,
@@ -117,6 +135,7 @@ def _build_chunks(
                     "chunk_size": chunk_size,
                     "overlap": overlap,
                 },
+                embedding=embedding,
             )
         )
 

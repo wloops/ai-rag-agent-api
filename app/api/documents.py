@@ -6,15 +6,17 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.models.user import User
+from app.schemas.chunk import ChunkListResponse
 from app.schemas.document import (
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentUploadResponse,
 )
-from app.utils.file_parser import parse_file
+from app.services.document_ingestion import create_pending_document, ingest_document_file
 
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -59,25 +61,17 @@ def _build_storage_path(user_id: int, knowledge_base_id: int, filename: str) -> 
     return UPLOAD_ROOT / str(user_id) / str(knowledge_base_id) / unique_filename
 
 
-async def _save_upload_file(upload_file: UploadFile, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def _get_owned_document(db: Session, document_id: int, current_user_id: int) -> Document:
+    # 文档查询统一走所属知识库校验，避免用户通过猜测 id 越权访问别人的数据。
+    document = (
+        db.query(Document)
+        .join(KnowledgeBase)
+        .filter(Document.id == document_id, KnowledgeBase.user_id == current_user_id)
+        .first()
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
 
-    try:
-        with destination.open("wb") as output_file:
-            while chunk := await upload_file.read(1024 * 1024):
-                output_file.write(chunk)
-    except OSError as exc:
-        raise RuntimeError(f"Failed to save uploaded file: {exc}") from exc
-    finally:
-        await upload_file.close()
-
-
-def _mark_document_failed(db: Session, document: Document, exc: Exception) -> Document:
-    # 解析或落盘失败时保留失败记录，便于后续排查问题。
-    document.status = "failed"
-    document.error_message = str(exc)
-    db.commit()
-    db.refresh(document)
     return document
 
 
@@ -91,30 +85,14 @@ async def upload_document(
     _get_owned_knowledge_base(db, knowledge_base_id, current_user.id)
     file_type = _get_file_type(file.filename)
     storage_path = _build_storage_path(current_user.id, knowledge_base_id, file.filename)
-
-    # 先创建 pending 记录，这样无论后续成功还是失败，数据库里都有可追踪状态。
-    document = Document(
+    document = create_pending_document(
+        db=db,
         knowledge_base_id=knowledge_base_id,
         filename=file.filename,
         file_type=file_type,
         storage_path=str(storage_path),
-        status="pending",
     )
-    db.add(document)
-    db.commit()
-    db.refresh(document)
-
-    try:
-        await _save_upload_file(file, storage_path)
-        parse_file(storage_path, file_type)
-    except Exception as exc:
-        return _mark_document_failed(db, document, exc)
-
-    document.status = "success"
-    document.error_message = None
-    db.commit()
-    db.refresh(document)
-    return document
+    return await ingest_document_file(db, document, file, storage_path, file_type)
 
 
 @router.get("", response_model=list[DocumentListResponse])
@@ -141,14 +119,21 @@ def get_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 文档详情查询也要通过知识库归属做权限收敛，避免直接枚举文档 id 越权。
-    document = (
-        db.query(Document)
-        .join(KnowledgeBase)
-        .filter(Document.id == id, KnowledgeBase.user_id == current_user.id)
-        .first()
-    )
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
+    return _get_owned_document(db, id, current_user.id)
 
-    return document
+
+@router.get("/{id}/chunks", response_model=list[ChunkListResponse])
+def list_document_chunks(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    document = _get_owned_document(db, id, current_user.id)
+
+    # 返回单个文档的 chunk 列表，按切片顺序升序输出，方便前端直接回放原始分片。
+    return (
+        db.query(Chunk)
+        .filter(Chunk.document_id == document.id)
+        .order_by(Chunk.chunk_index.asc())
+        .all()
+    )

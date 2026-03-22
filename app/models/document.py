@@ -23,3 +23,4 @@ class Document(Base):
 
     # 通过关系字段可以方便地拿到文档所属知识库。
     knowledge_base = relationship("KnowledgeBase", back_populates="documents")
+    chunks = relationship("Chunk", back_populates="document")

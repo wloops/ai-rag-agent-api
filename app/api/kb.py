@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends
+﻿from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -19,6 +19,17 @@ def create_kb(
     current_user: User = Depends(get_current_user),
 ):
     # current_user 来自鉴权依赖，所以这里只会为已登录用户创建知识库。
+    existing_kb = (
+        db.query(KnowledgeBase)
+        .filter(
+            KnowledgeBase.user_id == current_user.id,
+            KnowledgeBase.name == data.name,
+        )
+        .first()
+    )
+    if existing_kb:
+        raise HTTPException(status_code=400, detail="Knowledge base name already exists")
+
     kb = KnowledgeBase(
         user_id=current_user.id,
         name=data.name,

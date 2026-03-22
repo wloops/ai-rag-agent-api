@@ -5,10 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.auth import router as auth_router
+from app.api.documents import router as documents_router
 from app.api.kb import router as kb_router
 from app.core.database import Base, engine
 
 # 确保模型已导入，这样 create_all 才知道需要创建哪些表。
+from app.models.document import Document  # noqa: F401
 from app.models.knowledge_base import KnowledgeBase  # noqa: F401
 from app.models.user import User  # noqa: F401
 
@@ -47,3 +49,4 @@ def health():
 # 把不同业务模块的路由挂到主应用上。
 app.include_router(auth_router)
 app.include_router(kb_router)
+app.include_router(documents_router)

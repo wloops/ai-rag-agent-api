@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from app.models.conversation import Conversation
 from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
+from app.services.knowledge_base_service import get_active_owned_knowledge_base
 
 DEFAULT_CONVERSATION_TITLE = "新会话"
 MAX_AUTO_TITLE_LENGTH = 30
@@ -12,26 +13,17 @@ ALLOWED_MESSAGE_ROLES = {"user", "assistant"}
 
 
 def get_owned_knowledge_base(db, knowledge_base_id: int, current_user_id: int) -> KnowledgeBase:
-    knowledge_base = (
-        db.query(KnowledgeBase)
-        .filter(
-            KnowledgeBase.id == knowledge_base_id,
-            KnowledgeBase.user_id == current_user_id,
-        )
-        .first()
-    )
-    if not knowledge_base:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
-
-    return knowledge_base
+    return get_active_owned_knowledge_base(db, knowledge_base_id, current_user_id)
 
 
 def get_owned_conversation(db, conversation_id: int, current_user_id: int) -> Conversation:
     conversation = (
         db.query(Conversation)
+        .join(KnowledgeBase, Conversation.knowledge_base_id == KnowledgeBase.id)
         .filter(
             Conversation.id == conversation_id,
             Conversation.user_id == current_user_id,
+            KnowledgeBase.deleted_at.is_(None),
         )
         .first()
     )
@@ -64,7 +56,11 @@ def create_conversation(
 def list_conversations(db, current_user_id: int) -> list[Conversation]:
     return (
         db.query(Conversation)
-        .filter(Conversation.user_id == current_user_id)
+        .join(KnowledgeBase, Conversation.knowledge_base_id == KnowledgeBase.id)
+        .filter(
+            Conversation.user_id == current_user_id,
+            KnowledgeBase.deleted_at.is_(None),
+        )
         .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         .all()
     )
@@ -115,7 +111,6 @@ def save_message(
     if role not in ALLOWED_MESSAGE_ROLES:
         raise ValueError(f"Unsupported message role: {role}")
 
-    # 保存消息时同步刷新会话更新时间，方便前端按最近活跃时间展示列表。
     conversation.updated_at = datetime.utcnow()
     message = Message(
         conversation_id=conversation.id,

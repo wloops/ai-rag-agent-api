@@ -4,7 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class KnowledgeBaseCreate(BaseModel):
-    # 新建知识库时，前端提交的数据会先经过这里校验。
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+
+
+class KnowledgeBaseUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
 

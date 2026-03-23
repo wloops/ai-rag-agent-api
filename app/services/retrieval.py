@@ -4,24 +4,13 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.schemas.retrieval import RetrievalSearchItem
+from app.services.knowledge_base_service import get_active_owned_knowledge_base
 from app.utils.embeddings import embed_text
 
 
 def search_chunks(db, current_user_id: int, knowledge_base_id: int, query: str, top_k: int = 3):
-    knowledge_base = (
-        db.query(KnowledgeBase)
-        .filter(
-            KnowledgeBase.id == knowledge_base_id,
-            KnowledgeBase.user_id == current_user_id,
-        )
-        .first()
-    )
-    if not knowledge_base:
-        from fastapi import HTTPException
+    get_active_owned_knowledge_base(db, knowledge_base_id, current_user_id)
 
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
-
-    # 查询时只为用户问题生成一次 embedding，避免把计算成本放到每个 chunk 上。
     query_embedding = embed_text(query)
 
     if db.bind is not None and db.bind.dialect.name == "postgresql":
@@ -45,6 +34,7 @@ def _search_chunks_with_pgvector(db, knowledge_base_id: int, query_embedding: li
         .join(KnowledgeBase, Document.knowledge_base_id == KnowledgeBase.id)
         .filter(
             KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.deleted_at.is_(None),
             Chunk.embedding.is_not(None),
         )
         .order_by(distance_expr.asc())
@@ -72,6 +62,7 @@ def _search_chunks_in_python(db, knowledge_base_id: int, query_embedding: list[f
         .join(KnowledgeBase, Document.knowledge_base_id == KnowledgeBase.id)
         .filter(
             KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.deleted_at.is_(None),
             Chunk.embedding.is_not(None),
         )
         .all()

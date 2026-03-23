@@ -5,9 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
-from app.models.conversation import Conversation
 from app.models.knowledge_base import KnowledgeBase
-from app.models.message import Message
 from app.models.user import User
 from app.services.conversation_service import (
     build_conversation_title_from_question,
@@ -50,7 +48,6 @@ class ConversationServiceTestCase(unittest.TestCase):
 
         self.user_id = user.id
         self.knowledge_base_id = knowledge_base.id
-        self.other_knowledge_base_id = other_kb.id
 
     def tearDown(self):
         self.db.close()
@@ -133,3 +130,36 @@ class ConversationServiceTestCase(unittest.TestCase):
 
         messages = list_conversation_messages(self.db, conversation.id, self.user_id)
         self.assertEqual([message.role for message in messages], ["user", "assistant"])
+
+    def test_deleted_knowledge_base_hides_conversation_list(self):
+        create_conversation(
+            self.db,
+            current_user_id=self.user_id,
+            knowledge_base_id=self.knowledge_base_id,
+            title="隐藏会话",
+        )
+
+        knowledge_base = self.db.query(KnowledgeBase).filter(KnowledgeBase.id == self.knowledge_base_id).first()
+        knowledge_base.deleted_at = datetime.utcnow()
+        self.db.commit()
+
+        conversations = list_conversations(self.db, self.user_id)
+        self.assertEqual(conversations, [])
+
+    def test_deleted_knowledge_base_blocks_message_access(self):
+        conversation = create_conversation(
+            self.db,
+            current_user_id=self.user_id,
+            knowledge_base_id=self.knowledge_base_id,
+            title="不可访问会话",
+        )
+        save_message(self.db, conversation, "user", "hello")
+
+        knowledge_base = self.db.query(KnowledgeBase).filter(KnowledgeBase.id == self.knowledge_base_id).first()
+        knowledge_base.deleted_at = datetime.utcnow()
+        self.db.commit()
+
+        with self.assertRaises(Exception) as context:
+            list_conversation_messages(self.db, conversation.id, self.user_id)
+
+        self.assertEqual(context.exception.status_code, 404)

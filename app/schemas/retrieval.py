@@ -19,5 +19,7 @@ class RetrievalSearchItem(BaseModel):
     document_id: int
     filename: str
     chunk_index: int
+    start_offset: int
+    end_offset: int
     content: str
     score: float

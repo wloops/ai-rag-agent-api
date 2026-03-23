@@ -4,6 +4,7 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.schemas.retrieval import RetrievalSearchItem
+from app.services.document_service import get_chunk_offsets
 from app.services.knowledge_base_service import get_active_owned_knowledge_base
 from app.utils.embeddings import embed_text
 
@@ -21,12 +22,16 @@ def search_chunks(db, current_user_id: int, knowledge_base_id: int, query: str, 
 
 def _search_chunks_with_pgvector(db, knowledge_base_id: int, query_embedding: list[float], top_k: int):
     distance_expr = Chunk.embedding.cosine_distance(query_embedding)
+    start_offset_expr = Chunk.metadata_json["start_char"].as_integer()
+    end_offset_expr = Chunk.metadata_json["end_char"].as_integer()
     rows = (
         db.query(
             Chunk.id.label("chunk_id"),
             Document.id.label("document_id"),
             Document.filename.label("filename"),
             Chunk.chunk_index.label("chunk_index"),
+            start_offset_expr.label("start_offset"),
+            end_offset_expr.label("end_offset"),
             Chunk.content.label("content"),
             (1 - distance_expr).label("score"),
         )
@@ -48,6 +53,8 @@ def _search_chunks_with_pgvector(db, knowledge_base_id: int, query_embedding: li
             document_id=row.document_id,
             filename=row.filename,
             chunk_index=row.chunk_index,
+            start_offset=int(row.start_offset or 0),
+            end_offset=int(row.end_offset or row.start_offset or 0),
             content=row.content,
             score=float(row.score),
         )
@@ -74,12 +81,15 @@ def _search_chunks_in_python(db, knowledge_base_id: int, query_embedding: list[f
             continue
 
         score = _cosine_similarity(query_embedding, chunk.embedding)
+        start_offset, end_offset = get_chunk_offsets(chunk)
         scored_results.append(
             RetrievalSearchItem(
                 chunk_id=chunk.id,
                 document_id=document.id,
                 filename=document.filename,
                 chunk_index=chunk.chunk_index,
+                start_offset=start_offset,
+                end_offset=end_offset,
                 content=chunk.content,
                 score=score,
             )

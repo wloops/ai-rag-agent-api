@@ -148,9 +148,12 @@ def _build_citations(
 
         citations.append(
             ChatCitationItem(
+                chunk_id=item.chunk_id,
                 document_id=item.document_id,
                 filename=item.filename,
                 chunk_index=item.chunk_index,
+                start_offset=item.start_offset,
+                end_offset=item.end_offset,
                 snippet=_build_snippet(item.content),
             )
         )
@@ -161,9 +164,12 @@ def _build_citations(
 def _build_fallback_citations(retrieved_chunks: list[RetrievalSearchItem]) -> list[ChatCitationItem]:
     return [
         ChatCitationItem(
+            chunk_id=item.chunk_id,
             document_id=item.document_id,
             filename=item.filename,
             chunk_index=item.chunk_index,
+            start_offset=item.start_offset,
+            end_offset=item.end_offset,
             snippet=_build_snippet(item.content),
         )
         for item in retrieved_chunks[:3]

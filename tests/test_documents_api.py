@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
+import tempfile
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -31,6 +33,7 @@ class DocumentsApiTestCase(unittest.TestCase):
         )
         Base.metadata.create_all(bind=self.engine)
         self.db = self.testing_session_local()
+        self.temp_dir = tempfile.TemporaryDirectory()
 
         self.user = User(
             email="tester@example.com",
@@ -53,18 +56,23 @@ class DocumentsApiTestCase(unittest.TestCase):
         self.db.refresh(self.active_kb)
         self.db.refresh(self.deleted_kb)
 
+        active_storage_path = Path(self.temp_dir.name) / "active.txt"
+        active_storage_path.write_text("0123456789active chunk tail", encoding="utf-8")
+        deleted_storage_path = Path(self.temp_dir.name) / "deleted.txt"
+        deleted_storage_path.write_text("deleted chunk tail", encoding="utf-8")
+
         self.active_document = Document(
             knowledge_base_id=self.active_kb.id,
             filename="active.txt",
             file_type="txt",
-            storage_path="uploads/active.txt",
+            storage_path=str(active_storage_path),
             status="success",
         )
         self.deleted_document = Document(
             knowledge_base_id=self.deleted_kb.id,
             filename="deleted.txt",
             file_type="txt",
-            storage_path="uploads/deleted.txt",
+            storage_path=str(deleted_storage_path),
             status="success",
         )
         self.db.add_all([self.active_document, self.deleted_document])
@@ -72,25 +80,24 @@ class DocumentsApiTestCase(unittest.TestCase):
         self.db.refresh(self.active_document)
         self.db.refresh(self.deleted_document)
 
-        self.db.add_all(
-            [
-                Chunk(
-                    document_id=self.active_document.id,
-                    chunk_index=0,
-                    content="active chunk",
-                    metadata_json={"start_char": 0, "end_char": 12, "chunk_size": 100, "overlap": 0},
-                    embedding=[1.0, 0.0, 0.0],
-                ),
-                Chunk(
-                    document_id=self.deleted_document.id,
-                    chunk_index=0,
-                    content="deleted chunk",
-                    metadata_json={"start_char": 0, "end_char": 13, "chunk_size": 100, "overlap": 0},
-                    embedding=[1.0, 0.0, 0.0],
-                ),
-            ]
+        self.active_chunk = Chunk(
+            document_id=self.active_document.id,
+            chunk_index=0,
+            content="active chunk",
+            metadata_json={"start_char": 10, "end_char": 22, "chunk_size": 100, "overlap": 0},
+            embedding=[1.0, 0.0, 0.0],
         )
+        self.deleted_chunk = Chunk(
+            document_id=self.deleted_document.id,
+            chunk_index=0,
+            content="deleted chunk",
+            metadata_json={"start_char": 0, "end_char": 13, "chunk_size": 100, "overlap": 0},
+            embedding=[1.0, 0.0, 0.0],
+        )
+        self.db.add_all([self.active_chunk, self.deleted_chunk])
         self.db.commit()
+        self.db.refresh(self.active_chunk)
+        self.db.refresh(self.deleted_chunk)
 
         self.app = FastAPI()
         self.app.include_router(documents_router)
@@ -108,6 +115,7 @@ class DocumentsApiTestCase(unittest.TestCase):
         self.db.close()
         Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
+        self.temp_dir.cleanup()
 
     def test_list_documents_excludes_deleted_knowledge_base_documents(self):
         response = self.client.get("/api/documents")
@@ -134,3 +142,36 @@ class DocumentsApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], "Document not found")
+
+    def test_get_chunk_preview_returns_context_and_offsets(self):
+        response = self.client.get(
+            f"/api/documents/{self.active_document.id}/chunks/{self.active_chunk.id}/preview"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["document_id"], self.active_document.id)
+        self.assertEqual(payload["chunk_id"], self.active_chunk.id)
+        self.assertEqual(payload["filename"], "active.txt")
+        self.assertEqual(payload["chunk_index"], 0)
+        self.assertEqual(payload["start_offset"], 10)
+        self.assertEqual(payload["end_offset"], 22)
+        self.assertEqual(payload["preview_text"], "0123456789active chunk tail")
+        self.assertEqual(payload["highlight_start_offset"], 10)
+        self.assertEqual(payload["highlight_end_offset"], 22)
+
+    def test_get_chunk_preview_for_deleted_knowledge_base_returns_404(self):
+        response = self.client.get(
+            f"/api/documents/{self.deleted_document.id}/chunks/{self.deleted_chunk.id}/preview"
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Document not found")
+
+    def test_get_chunk_preview_with_mismatched_chunk_returns_404(self):
+        response = self.client.get(
+            f"/api/documents/{self.active_document.id}/chunks/{self.deleted_chunk.id}/preview"
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Chunk not found")

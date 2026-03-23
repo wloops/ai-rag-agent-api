@@ -10,9 +10,12 @@ class ChatAskRequest(BaseModel):
 
 
 class ChatCitationItem(BaseModel):
+    chunk_id: int | None = None
     document_id: int
     filename: str
     chunk_index: int
+    start_offset: int | None = None
+    end_offset: int | None = None
     snippet: str | None = None
 
 

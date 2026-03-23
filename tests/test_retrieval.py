@@ -118,8 +118,11 @@ class RetrievalServiceTestCase(unittest.TestCase):
             )
 
         self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].chunk_id, 1)
         self.assertEqual(results[0].content, "alpha chunk")
         self.assertEqual(results[0].filename, "demo.txt")
+        self.assertEqual(results[0].start_offset, 0)
+        self.assertEqual(results[0].end_offset, 5)
         self.assertGreater(results[0].score, results[1].score)
 
     def test_search_chunks_only_returns_requested_top_k(self):
@@ -133,7 +136,10 @@ class RetrievalServiceTestCase(unittest.TestCase):
             )
 
         self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chunk_id, 1)
         self.assertEqual(results[0].chunk_index, 0)
+        self.assertEqual(results[0].start_offset, 0)
+        self.assertEqual(results[0].end_offset, 5)
 
     def test_search_chunks_rejects_unowned_knowledge_base(self):
         with patch("app.services.retrieval.embed_text", return_value=[1.0, 0.0, 0.0]):

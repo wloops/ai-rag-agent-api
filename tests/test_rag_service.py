@@ -88,6 +88,8 @@ class RagServiceTestCase(unittest.TestCase):
                 document_id=1,
                 filename="demo.txt",
                 chunk_index=0,
+                start_offset=0,
+                end_offset=6,
                 content="第一段内容",
                 score=0.9,
             ),
@@ -96,6 +98,8 @@ class RagServiceTestCase(unittest.TestCase):
                 document_id=1,
                 filename="demo.txt",
                 chunk_index=1,
+                start_offset=6,
+                end_offset=12,
                 content="第二段内容",
                 score=0.8,
             ),
@@ -117,7 +121,10 @@ class RagServiceTestCase(unittest.TestCase):
 
         self.assertEqual(response.answer, "结论如下 [S1] 进一步说明 [S2]")
         self.assertEqual(len(response.citations), 2)
+        self.assertEqual(response.citations[0].chunk_id, 1)
         self.assertEqual(response.citations[0].chunk_index, 0)
+        self.assertEqual(response.citations[0].start_offset, 0)
+        self.assertEqual(response.citations[0].end_offset, 6)
         self.assertIsNone(response.retrieved_chunks)
 
         conversation = self.db.query(Conversation).filter(Conversation.id == response.conversation_id).first()
@@ -133,6 +140,9 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertEqual(messages[0].role, "user")
         self.assertEqual(messages[1].role, "assistant")
         self.assertEqual(len(messages[1].citations_json or []), 2)
+        self.assertEqual(messages[1].citations_json[0]["chunk_id"], 1)
+        self.assertEqual(messages[1].citations_json[0]["start_offset"], 0)
+        self.assertEqual(messages[1].citations_json[0]["end_offset"], 6)
 
     def test_falls_back_to_retrieved_chunks_when_model_has_no_source_ids(self):
         retrieved = [
@@ -141,6 +151,8 @@ class RagServiceTestCase(unittest.TestCase):
                 document_id=1,
                 filename="demo.txt",
                 chunk_index=0,
+                start_offset=0,
+                end_offset=6,
                 content="第一段内容",
                 score=0.9,
             ),
@@ -149,6 +161,8 @@ class RagServiceTestCase(unittest.TestCase):
                 document_id=1,
                 filename="demo.txt",
                 chunk_index=1,
+                start_offset=6,
+                end_offset=12,
                 content="第二段内容",
                 score=0.8,
             ),
@@ -169,6 +183,9 @@ class RagServiceTestCase(unittest.TestCase):
                 )
 
         self.assertEqual(len(response.citations), 2)
+        self.assertEqual(response.citations[0].chunk_id, 1)
+        self.assertEqual(response.citations[0].start_offset, 0)
+        self.assertEqual(response.citations[0].end_offset, 6)
         self.assertEqual(len(response.retrieved_chunks or []), 2)
 
     def test_blank_question_returns_400(self):
@@ -200,6 +217,8 @@ class RagServiceTestCase(unittest.TestCase):
                 document_id=1,
                 filename="demo.txt",
                 chunk_index=0,
+                start_offset=0,
+                end_offset=6,
                 content="第一段内容",
                 score=0.9,
             )

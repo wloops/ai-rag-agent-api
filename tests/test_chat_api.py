@@ -35,7 +35,10 @@ class ChatApiTestCase(unittest.TestCase):
                 {
                     "document_id": 1,
                     "filename": "demo.txt",
+                    "chunk_id": 101,
                     "chunk_index": 0,
+                    "start_offset": 10,
+                    "end_offset": 20,
                     "snippet": "片段",
                 }
             ],
@@ -111,7 +114,10 @@ class ChatApiTestCase(unittest.TestCase):
                     {
                         "document_id": 1,
                         "filename": "demo.txt",
+                        "chunk_id": 101,
                         "chunk_index": 0,
+                        "start_offset": 10,
+                        "end_offset": 20,
                         "snippet": "片段",
                     }
                 ],

@@ -10,13 +10,14 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.models.user import User
-from app.schemas.chunk import ChunkListResponse
+from app.schemas.chunk import ChunkListResponse, ChunkPreviewResponse
 from app.schemas.document import (
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentUploadResponse,
 )
 from app.services.document_ingestion import create_pending_document, ingest_document_file
+from app.services.document_service import build_chunk_preview, get_owned_document
 from app.services.knowledge_base_service import get_active_owned_knowledge_base
 
 
@@ -41,23 +42,6 @@ def _build_storage_path(user_id: int, knowledge_base_id: int, filename: str) -> 
     suffix = Path(filename).suffix.lower()
     unique_filename = f"{uuid4().hex}{suffix}"
     return UPLOAD_ROOT / str(user_id) / str(knowledge_base_id) / unique_filename
-
-
-def _get_owned_document(db: Session, document_id: int, current_user_id: int) -> Document:
-    document = (
-        db.query(Document)
-        .join(KnowledgeBase, Document.knowledge_base_id == KnowledgeBase.id)
-        .filter(
-            Document.id == document_id,
-            KnowledgeBase.user_id == current_user_id,
-            KnowledgeBase.deleted_at.is_(None),
-        )
-        .first()
-    )
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    return document
 
 
 @router.post("/upload", response_model=DocumentUploadResponse)
@@ -104,7 +88,7 @@ def get_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return _get_owned_document(db, id, current_user.id)
+    return get_owned_document(db, id, current_user.id)
 
 
 @router.get("/{id}/chunks", response_model=list[ChunkListResponse])
@@ -113,7 +97,7 @@ def list_document_chunks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    document = _get_owned_document(db, id, current_user.id)
+    document = get_owned_document(db, id, current_user.id)
 
     return (
         db.query(Chunk)
@@ -121,3 +105,13 @@ def list_document_chunks(
         .order_by(Chunk.chunk_index.asc())
         .all()
     )
+
+
+@router.get("/{document_id}/chunks/{chunk_id}/preview", response_model=ChunkPreviewResponse)
+def get_document_chunk_preview(
+    document_id: int,
+    chunk_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return build_chunk_preview(db, document_id, chunk_id, current_user.id)

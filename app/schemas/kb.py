@@ -1,4 +1,6 @@
-﻿from pydantic import BaseModel, Field
+from datetime import datetime
+
+from pydantic import BaseModel, Field
 
 
 class KnowledgeBaseCreate(BaseModel):
@@ -12,6 +14,8 @@ class KnowledgeBaseResponse(BaseModel):
     user_id: int
     name: str
     description: str | None
+    created_at: datetime
+    document_count: int
+    updated_at: datetime
 
-    # 允许把 ORM 对象直接返回给 FastAPI，再由 Pydantic 转成 JSON。
     model_config = {"from_attributes": True}

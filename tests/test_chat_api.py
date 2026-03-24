@@ -43,6 +43,32 @@ class ChatApiTestCase(unittest.TestCase):
                 }
             ],
             "retrieved_chunks": None,
+            "debug": {
+                "question": "什么是 demo？",
+                "knowledge_base_id": 1,
+                "top_k": 3,
+                "top1_score": 0.91,
+                "threshold": 0.35,
+                "decision": "answer",
+                "retrieval_ms": 12,
+                "llm_ms": 45,
+                "total_ms": 61,
+                "embedding_ms": 6,
+                "final_context_preview": "S1\ncontent: demo",
+                "retrieved_chunks": [
+                    {
+                        "chunk_id": 101,
+                        "document_id": 1,
+                        "filename": "demo.txt",
+                        "chunk_index": 0,
+                        "snippet": "demo snippet",
+                        "score": 0.91,
+                        "start_offset": 10,
+                        "end_offset": 20,
+                        "whether_cited": True,
+                    }
+                ],
+            },
         }
 
         with patch("app.api.chat.ask_knowledge_base", return_value=mocked_response):
@@ -52,13 +78,16 @@ class ChatApiTestCase(unittest.TestCase):
                     "knowledge_base_id": 1,
                     "question": "什么是 demo？",
                     "top_k": 3,
-                    "debug": False,
+                    "debug": True,
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["answer"], "答案 [S1]")
-        self.assertEqual(response.json()["conversation_id"], 10)
+        payload = response.json()
+        self.assertEqual(payload["answer"], "答案 [S1]")
+        self.assertEqual(payload["conversation_id"], 10)
+        self.assertEqual(payload["debug"]["decision"], "answer")
+        self.assertTrue(payload["debug"]["retrieved_chunks"][0]["whether_cited"])
 
     def test_create_conversation_returns_response(self):
         mocked_response = {

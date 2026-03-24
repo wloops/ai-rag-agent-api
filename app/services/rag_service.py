@@ -1,10 +1,13 @@
 import re
+from time import perf_counter
 
 from fastapi import HTTPException
 
 from app.schemas.chat import (
     ChatAskResponse,
     ChatCitationItem,
+    DebugInfo,
+    DebugRetrievedChunkItem,
     RetrievedChunkDebugItem,
 )
 from app.schemas.retrieval import RetrievalSearchItem
@@ -13,10 +16,11 @@ from app.services.conversation_service import (
     resolve_conversation_for_question,
     save_message,
 )
-from app.services.retrieval import search_chunks
+from app.services.retrieval import RetrievalTrace, search_chunks
 from app.utils.llm_client import generate_answer
 
 RELEVANCE_SCORE_THRESHOLD = 0.35
+FINAL_CONTEXT_PREVIEW_MAX_LENGTH = 2000
 NO_ANSWER_MESSAGE = "当前知识库中未找到足够相关内容。"
 SOURCE_ID_PATTERN = re.compile(r"\[(S\d+)\]")
 
@@ -30,6 +34,7 @@ def ask_knowledge_base(
     debug: bool = False,
     conversation_id: int | None = None,
 ) -> ChatAskResponse:
+    total_started_at = perf_counter()
     normalized_question = question.strip()
     if not normalized_question:
         raise HTTPException(status_code=400, detail="Question cannot be blank")
@@ -43,7 +48,6 @@ def ask_knowledge_base(
         conversation_id=conversation_id,
     )
 
-    # 先保存用户问题，这样即使后续检索结果为空，也能恢复完整会话历史。
     save_message(
         db=db,
         conversation=conversation,
@@ -51,23 +55,46 @@ def ask_knowledge_base(
         content=normalized_question,
     )
 
+    retrieval_trace = RetrievalTrace() if debug else None
+    retrieval_started_at = perf_counter()
     retrieved_chunks = search_chunks(
         db=db,
         current_user_id=current_user_id,
         knowledge_base_id=knowledge_base_id,
         query=normalized_question,
         top_k=top_k,
+        trace=retrieval_trace,
+    )
+    retrieval_ms = _elapsed_ms(retrieval_started_at)
+
+    top1_score = retrieved_chunks[0].score if retrieved_chunks else None
+    decision = (
+        "answer"
+        if top1_score is not None and top1_score >= RELEVANCE_SCORE_THRESHOLD
+        else "reject"
     )
 
-    if not retrieved_chunks or retrieved_chunks[0].score < RELEVANCE_SCORE_THRESHOLD:
+    llm_ms = 0
+    citations: list[ChatCitationItem]
+    final_context_preview: str | None = None
+    if decision == "reject":
         assistant_message = NO_ANSWER_MESSAGE
-        citations: list[ChatCitationItem] = []
+        citations = []
     else:
         source_mapping = _build_source_mapping(retrieved_chunks)
+        context_blocks = _build_context_blocks(source_mapping)
+        final_context_preview = _build_final_context_preview(context_blocks)
+
+        llm_started_at = perf_counter()
         assistant_message = generate_answer(
             system_prompt=_build_system_prompt(),
-            user_prompt=_build_user_prompt(normalized_question, source_mapping),
+            user_prompt=_build_user_prompt(
+                normalized_question,
+                source_mapping,
+                context_blocks=context_blocks,
+            ),
         )
+        llm_ms = _elapsed_ms(llm_started_at)
 
         cited_source_ids = _parse_cited_source_ids(assistant_message)
         citations = _build_citations(source_mapping, cited_source_ids)
@@ -82,11 +109,32 @@ def ask_knowledge_base(
         citations_json=[citation.model_dump() for citation in citations] or None,
     )
 
+    cited_chunk_ids = {
+        citation.chunk_id for citation in citations if citation.chunk_id is not None
+    }
+    debug_info = None
+    if debug:
+        debug_info = DebugInfo(
+            question=normalized_question,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+            top1_score=top1_score,
+            threshold=RELEVANCE_SCORE_THRESHOLD,
+            decision=decision,
+            retrieval_ms=retrieval_ms,
+            llm_ms=llm_ms,
+            total_ms=_elapsed_ms(total_started_at),
+            embedding_ms=retrieval_trace.embedding_ms if retrieval_trace is not None else None,
+            final_context_preview=final_context_preview,
+            retrieved_chunks=_build_detailed_debug_items(retrieved_chunks, cited_chunk_ids),
+        )
+
     return ChatAskResponse(
         conversation_id=conversation.id,
         answer=assistant_message,
         citations=citations,
         retrieved_chunks=_build_debug_items(retrieved_chunks) if debug else None,
+        debug=debug_info,
     )
 
 
@@ -100,13 +148,28 @@ def _build_system_prompt() -> str:
     )
 
 
-def _build_user_prompt(question: str, source_mapping: dict[str, RetrievalSearchItem]) -> str:
-    context_blocks = []
+def _build_user_prompt(
+    question: str,
+    source_mapping: dict[str, RetrievalSearchItem],
+    context_blocks: list[str] | None = None,
+) -> str:
+    if context_blocks is None:
+        context_blocks = _build_context_blocks(source_mapping)
+
+    return (
+        f"用户问题：{question}\n\n"
+        "请基于以下上下文回答：\n\n"
+        + "\n\n".join(context_blocks)
+    )
+
+
+def _build_context_blocks(source_mapping: dict[str, RetrievalSearchItem]) -> list[str]:
+    context_blocks: list[str] = []
     for source_id, item in source_mapping.items():
         context_blocks.append(
             "\n".join(
                 [
-                    f"{source_id}",
+                    source_id,
                     f"document_id: {item.document_id}",
                     f"filename: {item.filename}",
                     f"chunk_index: {item.chunk_index}",
@@ -115,12 +178,7 @@ def _build_user_prompt(question: str, source_mapping: dict[str, RetrievalSearchI
             )
         )
 
-    # Prompt 里显式限制模型只能依据检索到的上下文回答，避免模型脱离知识库自由发挥。
-    return (
-        f"用户问题：{question}\n\n"
-        "请基于以下上下文回答：\n\n"
-        + "\n\n".join(context_blocks)
-    )
+    return context_blocks
 
 
 def _build_source_mapping(retrieved_chunks: list[RetrievalSearchItem]) -> dict[str, RetrievalSearchItem]:
@@ -190,9 +248,47 @@ def _build_debug_items(retrieved_chunks: list[RetrievalSearchItem]) -> list[Retr
     ]
 
 
+def _build_detailed_debug_items(
+    retrieved_chunks: list[RetrievalSearchItem],
+    cited_chunk_ids: set[int],
+) -> list[DebugRetrievedChunkItem]:
+    return [
+        DebugRetrievedChunkItem(
+            chunk_id=item.chunk_id,
+            document_id=item.document_id,
+            filename=item.filename,
+            chunk_index=item.chunk_index,
+            snippet=_build_snippet(item.content, max_length=220),
+            score=item.score,
+            start_offset=item.start_offset,
+            end_offset=item.end_offset,
+            whether_cited=item.chunk_id in cited_chunk_ids,
+        )
+        for item in retrieved_chunks
+    ]
+
+
+def _build_final_context_preview(
+    context_blocks: list[str],
+    max_length: int = FINAL_CONTEXT_PREVIEW_MAX_LENGTH,
+) -> str | None:
+    if not context_blocks:
+        return None
+
+    preview = "\n\n".join(context_blocks).strip()
+    if len(preview) <= max_length:
+        return preview
+
+    return preview[:max_length].rstrip() + "..."
+
+
 def _build_snippet(content: str, max_length: int = 120) -> str:
     normalized_content = " ".join(content.split())
     if len(normalized_content) <= max_length:
         return normalized_content
 
     return normalized_content[:max_length] + "..."
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((perf_counter() - started_at) * 1000))

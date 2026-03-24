@@ -1,4 +1,6 @@
 import math
+from dataclasses import dataclass
+from time import perf_counter
 
 from app.models.chunk import Chunk
 from app.models.document import Document
@@ -9,10 +11,25 @@ from app.services.knowledge_base_service import get_active_owned_knowledge_base
 from app.utils.embeddings import embed_text
 
 
-def search_chunks(db, current_user_id: int, knowledge_base_id: int, query: str, top_k: int = 3):
+@dataclass
+class RetrievalTrace:
+    embedding_ms: int | None = None
+
+
+def search_chunks(
+    db,
+    current_user_id: int,
+    knowledge_base_id: int,
+    query: str,
+    top_k: int = 3,
+    trace: RetrievalTrace | None = None,
+):
     get_active_owned_knowledge_base(db, knowledge_base_id, current_user_id)
 
+    embedding_started_at = perf_counter()
     query_embedding = embed_text(query)
+    if trace is not None:
+        trace.embedding_ms = _elapsed_ms(embedding_started_at)
 
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         return _search_chunks_with_pgvector(db, knowledge_base_id, query_embedding, top_k)
@@ -111,3 +128,7 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
         return -1.0
 
     return dot_product / (left_norm * right_norm)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((perf_counter() - started_at) * 1000))

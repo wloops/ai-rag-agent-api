@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 import tempfile
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -175,3 +176,31 @@ class DocumentsApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], "Chunk not found")
+
+    def test_upload_document_returns_processing_and_enqueues_task(self):
+        with patch(
+            "app.api.documents.save_upload_file",
+            new=AsyncMock(return_value=None),
+        ) as mocked_save_upload_file:
+            with patch("app.api.documents.enqueue_document_ingestion") as mocked_enqueue:
+                response = self.client.post(
+                    "/api/documents/upload",
+                    data={"knowledge_base_id": str(self.active_kb.id)},
+                    files={"file": ("queued.txt", b"hello world", "text/plain")},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["filename"], "queued.txt")
+        self.assertEqual(payload["status"], "processing")
+        mocked_save_upload_file.assert_awaited_once()
+        mocked_enqueue.assert_called_once()
+
+        created_document = (
+            self.db.query(Document)
+            .filter(Document.filename == "queued.txt")
+            .order_by(Document.id.desc())
+            .first()
+        )
+        self.assertIsNotNone(created_document)
+        self.assertEqual(created_document.status, "processing")

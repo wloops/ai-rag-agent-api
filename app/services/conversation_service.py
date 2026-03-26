@@ -76,6 +76,23 @@ def list_conversation_messages(db, conversation_id: int, current_user_id: int) -
     )
 
 
+def list_recent_conversation_messages(
+    db,
+    conversation_id: int,
+    current_user_id: int,
+    limit: int = 6,
+) -> list[Message]:
+    conversation = get_owned_conversation(db, conversation_id, current_user_id)
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(messages))
+
+
 def resolve_conversation_for_question(
     db,
     current_user_id: int,

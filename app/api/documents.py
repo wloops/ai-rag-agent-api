@@ -16,9 +16,15 @@ from app.schemas.document import (
     DocumentListResponse,
     DocumentUploadResponse,
 )
-from app.services.document_ingestion import create_pending_document, ingest_document_file
+from app.services.document_ingestion import (
+    create_pending_document,
+    mark_document_failed,
+    mark_document_processing,
+    save_upload_file,
+)
 from app.services.document_service import build_chunk_preview, get_owned_document
 from app.services.knowledge_base_service import get_active_owned_knowledge_base
+from app.tasks.document_tasks import enqueue_document_ingestion
 
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -61,7 +67,14 @@ async def upload_document(
         file_type=file_type,
         storage_path=str(storage_path),
     )
-    return await ingest_document_file(db, document, file, storage_path, file_type)
+    try:
+        await save_upload_file(file, storage_path)
+        mark_document_processing(db, document)
+        enqueue_document_ingestion(document.id)
+        return document
+    except Exception as exc:
+        mark_document_failed(db, document, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("", response_model=list[DocumentListResponse])

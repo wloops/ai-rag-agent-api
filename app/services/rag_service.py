@@ -13,14 +13,17 @@ from app.schemas.chat import (
 from app.schemas.retrieval import RetrievalSearchItem
 from app.services.conversation_service import (
     get_owned_knowledge_base,
+    list_recent_conversation_messages,
     resolve_conversation_for_question,
     save_message,
 )
 from app.services.retrieval import RetrievalTrace, search_chunks
-from app.utils.llm_client import generate_answer
+from app.utils.llm_client import generate_answer, rewrite_question
 
 RELEVANCE_SCORE_THRESHOLD = 0.35
 FINAL_CONTEXT_PREVIEW_MAX_LENGTH = 2000
+RECENT_MESSAGE_WINDOW = 6
+RECENT_TURN_SUMMARY_MESSAGES = 4
 NO_ANSWER_MESSAGE = "当前知识库中未找到足够相关内容。"
 SOURCE_ID_PATTERN = re.compile(r"\[(S\d+)\]")
 
@@ -48,6 +51,15 @@ def ask_knowledge_base(
         conversation_id=conversation_id,
     )
 
+    recent_messages = list_recent_conversation_messages(
+        db=db,
+        conversation_id=conversation.id,
+        current_user_id=current_user_id,
+        limit=RECENT_MESSAGE_WINDOW,
+    )
+    standalone_question = _rewrite_question_with_history(recent_messages, normalized_question)
+    recent_turn_summary = _build_recent_turn_summary(recent_messages)
+
     save_message(
         db=db,
         conversation=conversation,
@@ -61,7 +73,7 @@ def ask_knowledge_base(
         db=db,
         current_user_id=current_user_id,
         knowledge_base_id=knowledge_base_id,
-        query=normalized_question,
+        query=standalone_question,
         top_k=top_k,
         trace=retrieval_trace,
     )
@@ -83,15 +95,21 @@ def ask_knowledge_base(
     else:
         source_mapping = _build_source_mapping(retrieved_chunks)
         context_blocks = _build_context_blocks(source_mapping)
-        final_context_preview = _build_final_context_preview(context_blocks)
+        final_context_preview = _build_final_context_preview(
+            standalone_question=standalone_question,
+            recent_turn_summary=recent_turn_summary,
+            context_blocks=context_blocks,
+        )
 
         llm_started_at = perf_counter()
         assistant_message = generate_answer(
             system_prompt=_build_system_prompt(),
             user_prompt=_build_user_prompt(
-                normalized_question,
-                source_mapping,
+                original_question=normalized_question,
+                standalone_question=standalone_question,
+                source_mapping=source_mapping,
                 context_blocks=context_blocks,
+                recent_turn_summary=recent_turn_summary,
             ),
         )
         llm_ms = _elapsed_ms(llm_started_at)
@@ -140,27 +158,31 @@ def ask_knowledge_base(
 
 def _build_system_prompt() -> str:
     return (
-        "你是知识库问答助手。"
+        "你是企业知识库问答助手。"
         "你只能依据提供的上下文回答，不能使用上下文之外的知识补全。"
         "如果上下文没有足够答案，必须明确回答“当前知识库中未找到足够相关内容”或“不知道”。"
-        "请尽量结构化回答。"
-        "引用依据时必须使用给定的 source id，例如 [S1]、[S2]。"
+        "回答尽量结构化，并在使用证据时引用 source id，例如 [S1]、[S2]。"
     )
 
 
 def _build_user_prompt(
-    question: str,
+    original_question: str,
+    standalone_question: str,
     source_mapping: dict[str, RetrievalSearchItem],
     context_blocks: list[str] | None = None,
+    recent_turn_summary: str | None = None,
 ) -> str:
     if context_blocks is None:
         context_blocks = _build_context_blocks(source_mapping)
 
-    return (
-        f"用户问题：{question}\n\n"
-        "请基于以下上下文回答：\n\n"
-        + "\n\n".join(context_blocks)
-    )
+    sections = [
+        f"用户原始问题：\n{original_question}",
+        f"用于检索的独立问题：\n{standalone_question}",
+    ]
+    if recent_turn_summary:
+        sections.append(f"最近对话摘要：\n{recent_turn_summary}")
+    sections.append("请基于以下上下文回答：\n\n" + "\n\n".join(context_blocks))
+    return "\n\n".join(sections)
 
 
 def _build_context_blocks(source_mapping: dict[str, RetrievalSearchItem]) -> list[str]:
@@ -177,11 +199,12 @@ def _build_context_blocks(source_mapping: dict[str, RetrievalSearchItem]) -> lis
                 ]
             )
         )
-
     return context_blocks
 
 
-def _build_source_mapping(retrieved_chunks: list[RetrievalSearchItem]) -> dict[str, RetrievalSearchItem]:
+def _build_source_mapping(
+    retrieved_chunks: list[RetrievalSearchItem],
+) -> dict[str, RetrievalSearchItem]:
     return {f"S{index + 1}": item for index, item in enumerate(retrieved_chunks)}
 
 
@@ -191,7 +214,6 @@ def _parse_cited_source_ids(answer: str) -> list[str]:
     for source_id in matched:
         if source_id not in unique_source_ids:
             unique_source_ids.append(source_id)
-
     return unique_source_ids
 
 
@@ -215,11 +237,12 @@ def _build_citations(
                 snippet=_build_snippet(item.content),
             )
         )
-
     return citations
 
 
-def _build_fallback_citations(retrieved_chunks: list[RetrievalSearchItem]) -> list[ChatCitationItem]:
+def _build_fallback_citations(
+    retrieved_chunks: list[RetrievalSearchItem],
+) -> list[ChatCitationItem]:
     return [
         ChatCitationItem(
             chunk_id=item.chunk_id,
@@ -234,7 +257,9 @@ def _build_fallback_citations(retrieved_chunks: list[RetrievalSearchItem]) -> li
     ]
 
 
-def _build_debug_items(retrieved_chunks: list[RetrievalSearchItem]) -> list[RetrievedChunkDebugItem]:
+def _build_debug_items(
+    retrieved_chunks: list[RetrievalSearchItem],
+) -> list[RetrievedChunkDebugItem]:
     return [
         RetrievedChunkDebugItem(
             chunk_id=item.chunk_id,
@@ -268,17 +293,47 @@ def _build_detailed_debug_items(
     ]
 
 
+def _rewrite_question_with_history(recent_messages: list[object], question: str) -> str:
+    if not recent_messages:
+        return question
+    return rewrite_question(recent_messages, question)
+
+
+def _build_recent_turn_summary(recent_messages: list[object]) -> str | None:
+    if not recent_messages:
+        return None
+
+    messages = recent_messages[-RECENT_TURN_SUMMARY_MESSAGES:]
+    lines: list[str] = []
+    for message in messages:
+        role = getattr(message, "role", "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = getattr(message, "content", "")
+        normalized_content = _build_snippet(content, max_length=160)
+        prefix = "用户" if role == "user" else "助手"
+        lines.append(f"- {prefix}: {normalized_content}")
+
+    return "\n".join(lines) or None
+
+
 def _build_final_context_preview(
+    standalone_question: str,
+    recent_turn_summary: str | None,
     context_blocks: list[str],
     max_length: int = FINAL_CONTEXT_PREVIEW_MAX_LENGTH,
 ) -> str | None:
     if not context_blocks:
         return None
 
-    preview = "\n\n".join(context_blocks).strip()
+    sections = [f"standalone_question:\n{standalone_question}"]
+    if recent_turn_summary:
+        sections.append(f"recent_turn_summary:\n{recent_turn_summary}")
+    sections.append("\n\n".join(context_blocks).strip())
+
+    preview = "\n\n".join(sections).strip()
     if len(preview) <= max_length:
         return preview
-
     return preview[:max_length].rstrip() + "..."
 
 
@@ -286,7 +341,6 @@ def _build_snippet(content: str, max_length: int = 120) -> str:
     normalized_content = " ".join(content.split())
     if len(normalized_content) <= max_length:
         return normalized_content
-
     return normalized_content[:max_length] + "..."
 
 

@@ -1,43 +1,35 @@
-# Backend
+# Backend 运行手册
 
-后端基于 FastAPI，使用 `uv` 管理依赖，默认通过 PostgreSQL + pgvector 存储数据。
+后端基于 `FastAPI + SQLAlchemy + PostgreSQL + pgvector + Redis + Celery`，负责认证、知识库管理、文档上传、异步建库、检索问答和多轮会话。
+
+## 目录说明
+
+- `app/api`: HTTP 接口层
+- `app/services`: 业务逻辑
+- `app/tasks`: Celery 异步任务
+- `app/utils`: LLM、Embedding、文件解析、切片等底层封装
+- `tests`: 后端单元测试
 
 ## 环境变量
 
 先复制模板：
 
-```bash
-cp .env.example .env
-```
-
-PowerShell 可用：
-
 ```powershell
 Copy-Item .env.example .env
 ```
 
-`.env` 同时给两类场景提供配置：
+核心变量：
 
-- 应用本地运行时使用 `DATABASE_URL`
-- 当前目录下的 `docker-compose.yml` 使用 `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB`
+- `DATABASE_URL`: 本地直连 PostgreSQL 时使用
+- `REDIS_URL`: Redis 连接地址
+- `CELERY_BROKER_URL`: Celery broker，默认可与 Redis 共用
+- `CELERY_RESULT_BACKEND`: Celery 结果后端，默认可与 Redis 共用
+- `EMBEDDING_*`: Embedding 模型配置
+- `LLM_*`: 大模型配置
 
-`DATABASE_URL` 的本地默认示例指向宿主机 `localhost:5432`。如果通过当前目录的 `docker compose` 启动后端容器，Compose 会自动把它覆盖为容器内的 `db:5432`。
+如果 `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` 为空，代码会回退到 `REDIS_URL`。
 
-## 仅启动数据库
-
-在当前目录执行：
-
-```bash
-docker compose up -d db
-```
-
-数据库就绪后，后端启动时会自动：
-
-- 创建表
-- 执行 `CREATE EXTENSION IF NOT EXISTS vector`
-- 补齐当前项目需要的 PostgreSQL 兼容索引/字段
-
-## 本地运行
+## 本地开发
 
 安装依赖：
 
@@ -45,10 +37,16 @@ docker compose up -d db
 uv sync
 ```
 
-启动服务：
+启动 API：
 
 ```bash
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+启动 Celery Worker：
+
+```bash
+uv run celery -A app.core.celery_app.celery_app worker --loglevel=info
 ```
 
 健康检查：
@@ -57,49 +55,104 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 curl http://localhost:8000/health
 ```
 
-## Docker 部署
+## Docker Compose
 
-### 仅构建后端镜像
+当前本地编排为：
 
-构建镜像：
+- `db`: PostgreSQL + pgvector
+- `redis`: Redis
+- `backend`: FastAPI API 服务
+- `worker`: Celery Worker
 
-```bash
-docker build -t ai-rag-agent-backend .
-```
-
-### 单独运行后端容器
-
-运行容器：
-
-```bash
-docker run --rm ^
-  -p 8000:8000 ^
-  --env-file .env ^
-  -e DATABASE_URL=postgresql://ai_rag_agent:change_me_123@host.docker.internal:5432/ai_rag_agent ^
-  -v ai-rag-agent-backend-uploads:/app/uploads ^
-  ai-rag-agent-backend
-```
-
-### 使用 Compose 启动数据库 + 后端
+启动全部服务：
 
 ```bash
 docker compose up --build
 ```
 
-访问地址：
+只启动基础依赖：
+
+```bash
+docker compose up -d db redis
+```
+
+接口地址：
 
 - API: `http://localhost:8000`
 - Health: `http://localhost:8000/health`
 
-说明：
+## 当前后端能力
 
-- 如果你只想要数据库，执行 `docker compose up -d db`
-- 如果你希望数据库和后端一起启动，执行 `docker compose up --build`
-- `host.docker.internal` 适用于 Docker Desktop 环境；如果你在 Linux 上运行独立容器，请改成宿主机实际可访问地址
+- JWT 注册、登录、当前用户查询
+- 知识库创建、列表、详情、软删除
+- 文档上传与状态查询
+- 文档异步处理：保存文件、解析、清洗、切片、Embedding、Chunk 入库
+- pgvector 相似度检索
+- RAG 问答与引用返回
+- 多轮会话：最近消息参与问题改写和回答 Prompt
+- 会话历史与消息列表
+- Chunk 原文预览
 
-## 与本地运行的差异
+## 异步文档处理链路
 
-- 本地运行时，`backend/.env` 中的 `DATABASE_URL` 应指向 `localhost:5432`
-- Compose 启动时，数据库连接会自动切换到 `db:5432`
-- Compose 会额外挂载 `/app/uploads` 卷，避免容器重建后上传文件丢失
-- 前端不在这里编排，前端请单独参考 [frontend/README.md](/G:/@restflux.com/workspace/Open/ai-rag-agent/frontend/README.md)
+当前上传接口不是同步建库，而是：
+
+1. 接口校验文件类型与知识库归属
+2. 保存原始文件到 `uploads/`
+3. 创建 `documents` 记录
+4. 将状态推进到 `processing`
+5. 投递 Celery 任务
+6. Worker 后台完成解析、切片、Embedding、Chunk 入库
+7. 最终写回 `success` 或 `failed`
+
+状态含义：
+
+- `pending`: 记录已创建，尚未开始执行
+- `processing`: 已入队或正在由 worker 处理
+- `success`: 建库完成
+- `failed`: 处理失败，可查看 `error_message`
+
+## 多轮会话记忆
+
+当前实现不是把 Redis 当聊天记忆，而是：
+
+- 会话和消息持久化在 PostgreSQL
+- 继续追问时读取最近 6 条消息
+- 先把当前问题改写成独立问题，再做向量检索
+- 把最近 2 轮摘要一起带入最终回答 Prompt
+
+这样做的目的，是让多轮问答既能保留上下文，又不会让检索直接吃到模糊指代。
+
+## 测试
+
+运行后端测试：
+
+```bash
+uv run python -m unittest discover -s tests
+```
+
+当前测试覆盖：
+
+- API 路由
+- 文档上传与预览
+- 异步任务状态流转
+- 文本清洗与切片
+- Embedding / LLM 封装
+- Retrieval / RAG / 会话服务
+
+## 常见问题
+
+### 1. 上传后文档一直是 `processing`
+
+- 先确认 Redis 是否启动
+- 再确认 Celery worker 是否启动
+- 检查 `LLM_*` / `EMBEDDING_*` 配置是否有效
+
+### 2. `docker compose up --build` 后无法处理文档
+
+- 确认 `worker` 服务已正常拉起
+- 确认 `backend/.env` 中 API key 可在容器内使用
+
+### 3. 为什么没有先接 LangChain
+
+当前项目优先保证主链路、异步工程化和可解释性。现阶段直接封装 Embedding、Retrieval、LLM Client 更轻量，也更方便面试时讲清楚数据流和控制点。

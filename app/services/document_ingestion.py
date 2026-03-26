@@ -14,6 +14,14 @@ DEFAULT_CHUNK_SIZE = 700
 DEFAULT_CHUNK_OVERLAP = 100
 
 
+class RetryableDocumentProcessingError(RuntimeError):
+    pass
+
+
+class NonRetryableDocumentProcessingError(RuntimeError):
+    pass
+
+
 def create_pending_document(
     db: Session,
     knowledge_base_id: int,
@@ -21,7 +29,6 @@ def create_pending_document(
     file_type: str,
     storage_path: str,
 ) -> Document:
-    # 先创建 pending 记录，这样无论后续成功还是失败，数据库里都有可追踪状态。
     document = Document(
         knowledge_base_id=knowledge_base_id,
         filename=filename,
@@ -30,6 +37,22 @@ def create_pending_document(
         status="pending",
     )
     db.add(document)
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def mark_document_processing(db: Session, document: Document) -> Document:
+    document.status = "processing"
+    document.error_message = None
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def mark_document_failed(db: Session, document: Document, exc: Exception) -> Document:
+    document.status = "failed"
+    document.error_message = str(exc)
     db.commit()
     db.refresh(document)
     return document
@@ -45,19 +68,56 @@ async def ingest_document_file(
     overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> Document:
     try:
-        await _save_upload_file(upload_file, storage_path)
-        raw_text = parse_file(storage_path, file_type)
-        cleaned_text = clean_text(raw_text)
-        return persist_document_chunks(
+        await save_upload_file(upload_file, storage_path)
+        document.file_type = file_type
+        document.storage_path = str(storage_path)
+        mark_document_processing(db, document)
+        ingest_document_from_storage(
             db,
             document,
-            cleaned_text,
             chunk_size=chunk_size,
             overlap=overlap,
         )
+        return document
     except Exception as exc:
         db.rollback()
-        return _mark_document_failed(db, document, exc)
+        return mark_document_failed(db, document, exc)
+
+
+async def save_upload_file(upload_file: UploadFile, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with destination.open("wb") as output_file:
+            while chunk := await upload_file.read(1024 * 1024):
+                output_file.write(chunk)
+    except OSError as exc:
+        raise NonRetryableDocumentProcessingError(
+            f"Failed to save uploaded file: {exc}"
+        ) from exc
+    finally:
+        await upload_file.close()
+
+
+def ingest_document_from_storage(
+    db: Session,
+    document: Document,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> Document:
+    try:
+        raw_text = parse_file(Path(document.storage_path), document.file_type)
+    except Exception as exc:
+        raise NonRetryableDocumentProcessingError(str(exc)) from exc
+
+    cleaned_text = clean_text(raw_text)
+    return persist_document_chunks_or_raise(
+        db,
+        document,
+        cleaned_text,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
 
 
 def persist_document_chunks(
@@ -68,16 +128,32 @@ def persist_document_chunks(
     overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> Document:
     try:
-        chunk_ranges = iter_chunk_ranges(text, chunk_size=chunk_size, overlap=overlap)
-        chunk_contents = [text[start:end] for start, end in chunk_ranges]
+        return persist_document_chunks_or_raise(
+            db,
+            document,
+            text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+    except Exception as exc:
+        db.rollback()
+        return mark_document_failed(db, document, exc)
 
-        if chunk_contents:
-            # chunk 的 embedding 在入库前统一生成，避免查询时临时计算带来额外延迟和成本。
-            embeddings = embed_texts(chunk_contents)
-        else:
-            embeddings = []
 
-        chunks = _build_chunks(
+def persist_document_chunks_or_raise(
+    db: Session,
+    document: Document,
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> Document:
+    chunk_ranges = _build_chunk_ranges(text, chunk_size=chunk_size, overlap=overlap)
+    chunk_contents = [text[start:end] for start, end in chunk_ranges]
+    embeddings = _build_embeddings(chunk_contents)
+
+    db.query(Chunk).filter(Chunk.document_id == document.id).delete()
+    db.add_all(
+        _build_chunks(
             document.id,
             text,
             chunk_ranges,
@@ -85,30 +161,29 @@ def persist_document_chunks(
             chunk_size,
             overlap,
         )
+    )
+    document.status = "success"
+    document.error_message = None
+    db.commit()
+    db.refresh(document)
+    return document
 
-        # chunk 入库和文档成功状态放在同一次提交里，避免出现 success 但 chunk 不完整。
-        db.add_all(chunks)
-        document.status = "success"
-        document.error_message = None
-        db.commit()
-        db.refresh(document)
-        return document
+
+def _build_chunk_ranges(text: str, chunk_size: int, overlap: int) -> list[tuple[int, int]]:
+    try:
+        return iter_chunk_ranges(text, chunk_size=chunk_size, overlap=overlap)
     except Exception as exc:
-        db.rollback()
-        return _mark_document_failed(db, document, exc)
+        raise NonRetryableDocumentProcessingError(str(exc)) from exc
 
 
-async def _save_upload_file(upload_file: UploadFile, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def _build_embeddings(chunk_contents: list[str]) -> list[list[float]]:
+    if not chunk_contents:
+        return []
 
     try:
-        with destination.open("wb") as output_file:
-            while chunk := await upload_file.read(1024 * 1024):
-                output_file.write(chunk)
-    except OSError as exc:
-        raise RuntimeError(f"Failed to save uploaded file: {exc}") from exc
-    finally:
-        await upload_file.close()
+        return embed_texts(chunk_contents)
+    except Exception as exc:
+        raise RetryableDocumentProcessingError(str(exc)) from exc
 
 
 def _build_chunks(
@@ -140,12 +215,3 @@ def _build_chunks(
         )
 
     return chunks
-
-
-def _mark_document_failed(db: Session, document: Document, exc: Exception) -> Document:
-    # 任一关键步骤失败都要把文档明确标记为 failed，方便前端和排障流程感知异常。
-    document.status = "failed"
-    document.error_message = str(exc)
-    db.commit()
-    db.refresh(document)
-    return document

@@ -353,3 +353,73 @@ class RagServiceTestCase(unittest.TestCase):
             )
 
         self.assertEqual(context.exception.status_code, 404)
+
+    def test_existing_history_rewrites_follow_up_question_before_retrieval(self):
+        conversation = Conversation(
+            user_id=self.user_id,
+            knowledge_base_id=self.knowledge_base_id,
+            title="history",
+        )
+        self.db.add(conversation)
+        self.db.commit()
+        self.db.refresh(conversation)
+
+        self.db.add_all(
+            [
+                Message(
+                    conversation_id=conversation.id,
+                    role="user",
+                    content="请介绍一下请假制度",
+                ),
+                Message(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content="请假需要提前发起审批。",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        retrieved = [
+            RetrievalSearchItem(
+                chunk_id=1,
+                document_id=1,
+                filename="demo.txt",
+                chunk_index=0,
+                start_offset=0,
+                end_offset=8,
+                content="请假审批需要提前两天提交。",
+                score=0.88,
+            )
+        ]
+
+        with patch(
+            "app.services.rag_service.rewrite_question",
+            return_value="请假制度里请假审批需要提前多久提交？",
+        ) as mocked_rewrite:
+            with patch(
+                "app.services.rag_service.search_chunks",
+                return_value=retrieved,
+            ) as mocked_search:
+                with patch(
+                    "app.services.rag_service.generate_answer",
+                    return_value="需要提前两天提交审批。 [S1]",
+                ):
+                    response = ask_knowledge_base(
+                        db=self.db,
+                        current_user_id=self.user_id,
+                        knowledge_base_id=self.knowledge_base_id,
+                        question="那要提前多久？",
+                        top_k=3,
+                        debug=True,
+                        conversation_id=conversation.id,
+                    )
+
+        self.assertEqual(response.answer, "需要提前两天提交审批。 [S1]")
+        mocked_rewrite.assert_called_once()
+        self.assertEqual(
+            mocked_search.call_args.kwargs["query"],
+            "请假制度里请假审批需要提前多久提交？",
+        )
+        self.assertIsNotNone(response.debug.final_context_preview)
+        self.assertIn("recent_turn_summary", response.debug.final_context_preview)

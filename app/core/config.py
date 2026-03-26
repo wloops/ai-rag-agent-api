@@ -2,11 +2,17 @@
 
 
 class Settings(BaseSettings):
-    # 这些字段会从 .env 里读取，并自动转换成对应的 Python 类型。
     database_url: str
     secret_key: str
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str | None = None
+    celery_result_backend: str | None = None
+    celery_task_always_eager: bool = False
+    celery_task_eager_propagates: bool = True
+    celery_document_max_retries: int = 3
+    celery_document_retry_base_seconds: int = 5
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_model: str = "text-embedding-3-small"
@@ -15,9 +21,15 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "glm-4.5-air"
 
-    # env_file=".env" 表示优先从项目根目录的 .env 加载配置。
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    @property
+    def resolved_celery_broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
 
-# 在应用启动时创建一个全局配置对象，其他模块直接 import 使用。
+    @property
+    def resolved_celery_result_backend(self) -> str:
+        return self.celery_result_backend or self.redis_url
+
+
 settings = Settings()

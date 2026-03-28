@@ -10,6 +10,7 @@ from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.kb import router as kb_router
 from app.api.retrieval import router as retrieval_router
+from app.core.config import settings
 from app.core.database import Base, engine
 from app.models.chunk import Chunk  # noqa: F401
 from app.models.conversation import Conversation  # noqa: F401
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.resolved_cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -18,6 +18,12 @@
 Copy-Item .env.example .env
 ```
 
+如果从项目根目录使用统一 Docker Compose 部署，只有在需要自定义端口或数据库容器参数时，才需要额外复制：
+
+```powershell
+Copy-Item ../.env.example ../.env
+```
+
 核心变量：
 
 - `DATABASE_URL`: 本地直连 PostgreSQL 时使用
@@ -57,6 +63,8 @@ curl http://localhost:8000/health
 
 ## Docker Compose
 
+后端目录下的 `docker-compose.yml` 适合只启动后端相关服务：
+
 当前本地编排为：
 
 - `db`: PostgreSQL + pgvector
@@ -68,6 +76,13 @@ curl http://localhost:8000/health
 
 ```bash
 docker compose up --build
+```
+
+如果要连前端一起启动，请回到项目根目录执行：
+
+```bash
+cd ..
+docker compose up -d --build
 ```
 
 只启动基础依赖：
@@ -152,6 +167,7 @@ uv run python -m unittest discover -s tests
 
 - 确认 `worker` 服务已正常拉起
 - 确认 `backend/.env` 中 API key 可在容器内使用
+- 如果使用项目根目录编排，确认根目录 `.env` 的数据库配置没有和 `backend/.env` 的预期冲突
 
 ### 3. 为什么没有先接 LangChain
 

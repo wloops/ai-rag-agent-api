@@ -70,7 +70,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-    command: celery -A app.core.celery_app.celery_app worker --loglevel=info
+    command: uv run celery -A app.core.celery_app.celery_app worker --loglevel=info
 
 volumes:
   postgres_data:

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "glm-4.5-air"
+    cors_allow_origins: str = "https://rag.restflux.online"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -30,6 +31,16 @@ class Settings(BaseSettings):
     @property
     def resolved_celery_result_backend(self) -> str:
         return self.celery_result_backend or self.redis_url
+
+    @property
+    def resolved_cors_allow_origins(self) -> list[str]:
+        # 用逗号分隔，便于线上快速切换允许的前端域名，而不需要改代码。
+        origins = [
+            origin.strip()
+            for origin in self.cors_allow_origins.split(",")
+            if origin.strip()
+        ]
+        return origins or ["https://rag.restflux.online"]
 
 
 settings = Settings()

@@ -1,5 +1,8 @@
-from fastapi import APIRouter, Depends
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from starlette.responses import StreamingResponse
 
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -15,7 +18,7 @@ from app.services.conversation_service import (
     list_conversation_messages,
     list_conversations,
 )
-from app.services.rag_service import ask_knowledge_base
+from app.services.rag_service import ask_knowledge_base, stream_knowledge_base_events
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -27,7 +30,6 @@ def create_chat_conversation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 路由层只负责参数接收与鉴权，会话标题和归属校验都由 service 层统一处理。
     return create_conversation(
         db=db,
         current_user_id=current_user.id,
@@ -59,7 +61,6 @@ def ask_chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 路由层只负责接参与鉴权，检索、Prompt 构造、会话落库和模型生成都放在 service 中统一处理。
     return ask_knowledge_base(
         db=db,
         current_user_id=current_user.id,
@@ -69,3 +70,41 @@ def ask_chat(
         debug=data.debug,
         conversation_id=data.conversation_id,
     )
+
+
+@router.post("/ask/stream")
+def ask_chat_stream(
+    data: ChatAskRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    def event_stream():
+        try:
+            for event_name, payload in stream_knowledge_base_events(
+                db=db,
+                current_user_id=current_user.id,
+                knowledge_base_id=data.knowledge_base_id,
+                question=data.question,
+                top_k=data.top_k,
+                debug=data.debug,
+                conversation_id=data.conversation_id,
+            ):
+                yield _format_sse_event(event_name, payload)
+        except HTTPException as exc:
+            yield _format_sse_event("error", {"detail": exc.detail})
+        except Exception as exc:
+            yield _format_sse_event("error", {"detail": str(exc)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _format_sse_event(event_name: str, payload: dict) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 from app.core.config import settings
 
@@ -9,12 +9,7 @@ def generate_answer(system_prompt: str, user_prompt: str) -> str:
 
     client = _create_llm_client()
     response = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
+        **_build_chat_completion_params(system_prompt, user_prompt)
     )
 
     choices = getattr(response, "choices", None) or []
@@ -26,6 +21,29 @@ def generate_answer(system_prompt: str, user_prompt: str) -> str:
         raise RuntimeError("LLM returned empty content")
 
     return content.strip()
+
+
+def stream_answer(system_prompt: str, user_prompt: str) -> Iterator[str]:
+    if not settings.llm_api_key:
+        raise RuntimeError("LLM API key is not configured")
+
+    client = _create_llm_client()
+    stream = client.chat.completions.create(
+        **_build_chat_completion_params(system_prompt, user_prompt),
+        stream=True,
+    )
+
+    yielded = False
+    for chunk in stream:
+        delta_text = _extract_delta_content(chunk)
+        if not delta_text:
+            continue
+
+        yielded = True
+        yield delta_text
+
+    if not yielded:
+        raise RuntimeError("LLM returned empty content")
 
 
 def rewrite_question(messages: Sequence[object], question: str) -> str:
@@ -95,6 +113,45 @@ def _normalize_rewritten_question(rewritten: str, fallback: str) -> str:
             break
 
     return normalized or fallback
+
+
+def _build_chat_completion_params(system_prompt: str, user_prompt: str) -> dict:
+    return {
+        "model": settings.llm_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+
+def _extract_delta_content(chunk: object) -> str:
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return ""
+
+    delta = getattr(choices[0], "delta", None)
+    if delta is None:
+        return ""
+
+    content = getattr(delta, "content", None)
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    segments: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            segments.append(item)
+            continue
+
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            segments.append(text)
+
+    return "".join(segments)
 
 
 def _create_llm_client():

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.utils.llm_client import generate_answer, rewrite_question
+from app.utils.llm_client import generate_answer, rewrite_question, stream_answer
 
 
 class LlmClientTestCase(unittest.TestCase):
@@ -45,6 +45,44 @@ class LlmClientTestCase(unittest.TestCase):
             with patch("app.utils.llm_client.settings.llm_api_key", "test-key"):
                 with self.assertRaises(RuntimeError):
                     generate_answer("system", "user")
+
+    def test_stream_answer_yields_delta_content(self):
+        mock_stream = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="杩欐槸"))]
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="绛旀"))]
+            ),
+        ]
+        mock_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: mock_stream)
+            )
+        )
+
+        with patch("app.utils.llm_client._create_llm_client", return_value=mock_client):
+            with patch("app.utils.llm_client.settings.llm_api_key", "test-key"):
+                result = list(stream_answer("system", "user"))
+
+        self.assertEqual(result, ["杩欐槸", "绛旀"])
+
+    def test_stream_answer_raises_when_no_delta_content(self):
+        mock_stream = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=None))]
+            )
+        ]
+        mock_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: mock_stream)
+            )
+        )
+
+        with patch("app.utils.llm_client._create_llm_client", return_value=mock_client):
+            with patch("app.utils.llm_client.settings.llm_api_key", "test-key"):
+                with self.assertRaises(RuntimeError):
+                    list(stream_answer("system", "user"))
 
     def test_rewrite_question_returns_standalone_question(self):
         history = [

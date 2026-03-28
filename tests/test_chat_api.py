@@ -89,6 +89,64 @@ class ChatApiTestCase(unittest.TestCase):
         self.assertEqual(payload["debug"]["decision"], "answer")
         self.assertTrue(payload["debug"]["retrieved_chunks"][0]["whether_cited"])
 
+    def test_chat_ask_stream_returns_sse_events(self):
+        mocked_events = iter(
+            [
+                ("start", {"conversation_id": 10}),
+                ("delta", {"content": "绛旀"}),
+                (
+                    "final",
+                    {
+                        "conversation_id": 10,
+                        "answer": "绛旀 [S1]",
+                        "citations": [],
+                        "retrieved_chunks": None,
+                        "debug": None,
+                    },
+                ),
+            ]
+        )
+
+        with patch("app.api.chat.stream_knowledge_base_events", return_value=mocked_events):
+            with self.client.stream(
+                "POST",
+                "/api/chat/ask/stream",
+                json={
+                    "knowledge_base_id": 1,
+                    "question": "demo",
+                    "top_k": 3,
+                    "debug": True,
+                },
+            ) as response:
+                payload = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: start", payload)
+        self.assertIn("event: delta", payload)
+        self.assertIn("event: final", payload)
+        self.assertIn('"conversation_id": 10', payload)
+
+    def test_chat_ask_stream_returns_error_event_when_service_fails(self):
+        with patch(
+            "app.api.chat.stream_knowledge_base_events",
+            side_effect=RuntimeError("stream failed"),
+        ):
+            with self.client.stream(
+                "POST",
+                "/api/chat/ask/stream",
+                json={
+                    "knowledge_base_id": 1,
+                    "question": "demo",
+                    "top_k": 3,
+                    "debug": True,
+                },
+            ) as response:
+                payload = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: error", payload)
+        self.assertIn("stream failed", payload)
+
     def test_create_conversation_returns_response(self):
         mocked_response = {
             "id": 1,

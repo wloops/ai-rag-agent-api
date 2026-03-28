@@ -10,7 +10,11 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
 from app.models.user import User
 from app.schemas.retrieval import RetrievalSearchItem
-from app.services.rag_service import NO_ANSWER_MESSAGE, ask_knowledge_base
+from app.services.rag_service import (
+    NO_ANSWER_MESSAGE,
+    ask_knowledge_base,
+    stream_knowledge_base_events,
+)
 
 
 class RagServiceTestCase(unittest.TestCase):
@@ -423,3 +427,78 @@ class RagServiceTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(response.debug.final_context_preview)
         self.assertIn("recent_turn_summary", response.debug.final_context_preview)
+
+    def test_stream_events_emit_start_delta_final_and_save_assistant_message(self):
+        retrieved = [
+            RetrievalSearchItem(
+                chunk_id=1,
+                document_id=1,
+                filename="demo.txt",
+                chunk_index=0,
+                start_offset=0,
+                end_offset=6,
+                content="绗竴娈靛唴瀹?",
+                score=0.9,
+            )
+        ]
+
+        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+            with patch(
+                "app.services.rag_service.stream_answer",
+                return_value=iter(["绛旀", " [S1]"]),
+            ):
+                events = list(
+                    stream_knowledge_base_events(
+                        db=self.db,
+                        current_user_id=self.user_id,
+                        knowledge_base_id=self.knowledge_base_id,
+                        question="闂",
+                        top_k=3,
+                        debug=True,
+                    )
+                )
+
+        self.assertEqual([name for name, _ in events], ["start", "delta", "delta", "final"])
+        self.assertEqual(events[-1][1]["answer"], "绛旀 [S1]")
+        messages = (
+            self.db.query(Message)
+            .filter(Message.conversation_id == events[-1][1]["conversation_id"])
+            .order_by(Message.id.asc())
+            .all()
+        )
+        self.assertEqual([message.role for message in messages], ["user", "assistant"])
+        self.assertEqual(messages[-1].content, "绛旀 [S1]")
+
+    def test_stream_error_does_not_save_assistant_message(self):
+        retrieved = [
+            RetrievalSearchItem(
+                chunk_id=1,
+                document_id=1,
+                filename="demo.txt",
+                chunk_index=0,
+                start_offset=0,
+                end_offset=6,
+                content="绗竴娈靛唴瀹?",
+                score=0.9,
+            )
+        ]
+
+        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+            with patch(
+                "app.services.rag_service.stream_answer",
+                side_effect=RuntimeError("llm unavailable"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    list(
+                        stream_knowledge_base_events(
+                            db=self.db,
+                            current_user_id=self.user_id,
+                            knowledge_base_id=self.knowledge_base_id,
+                            question="闂",
+                            top_k=3,
+                            debug=False,
+                        )
+                    )
+
+        messages = self.db.query(Message).order_by(Message.id.asc()).all()
+        self.assertEqual([message.role for message in messages], ["user"])

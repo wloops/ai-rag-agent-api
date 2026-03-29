@@ -47,6 +47,14 @@ class DebugGraphTraceItem(BaseModel):
     status: Literal["completed", "skipped"]
     duration_ms: int
     detail: str
+    used_history: bool | None = None
+    rewritten_question: str | None = None
+    retrieval_count: int | None = None
+    top1_score: float | None = None
+    threshold: float | None = None
+    decision: Literal["answer", "reject"] | None = None
+    cited_count: int | None = None
+    used_fallback_citations: bool | None = None
 
 
 class DebugInfo(BaseModel):

@@ -78,6 +78,7 @@ class AskGraphState(TypedDict, total=False):
     source_mapping: dict[str, RetrievalSearchItem]
     final_context_preview: str | None
     citations: list[ChatCitationItem]
+    used_fallback_citations: bool
     response: ChatAskResponse
     graph_trace: Annotated[list[DebugGraphTraceItem], operator.add]
 
@@ -288,6 +289,10 @@ def _graph_node_rewrite_question(state: AskGraphState) -> AskGraphState:
             "standalone_question": standalone_question,
             "recent_turn_summary": recent_turn_summary,
         },
+        trace_overrides={
+            "used_history": used_history,
+            "rewritten_question": standalone_question,
+        },
     )
 
 
@@ -318,6 +323,10 @@ def _graph_node_retrieve_context(state: AskGraphState) -> AskGraphState:
             "retrieval_trace": retrieval_trace,
             "retrieved_chunks": retrieved_chunks,
             "retrieval_ms": retrieval_ms,
+            "top1_score": top1_score,
+        },
+        trace_overrides={
+            "retrieval_count": len(retrieved_chunks),
             "top1_score": top1_score,
         },
     )
@@ -356,6 +365,11 @@ def _graph_node_relevance_guard(state: AskGraphState) -> AskGraphState:
         started_at=started_at,
         detail=detail,
         updates=updates,
+        trace_overrides={
+            "top1_score": top1_score,
+            "threshold": RELEVANCE_SCORE_THRESHOLD,
+            "decision": decision,
+        },
     )
 
 
@@ -383,7 +397,14 @@ def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
             started_at=started_at,
             detail="Skipped citation building because the request was rejected.",
             status="skipped",
-            updates={"citations": []},
+            updates={
+                "citations": [],
+                "used_fallback_citations": False,
+            },
+            trace_overrides={
+                "cited_count": 0,
+                "used_fallback_citations": False,
+            },
         )
 
     source_mapping = state.get("source_mapping") or _build_source_mapping(
@@ -394,6 +415,8 @@ def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
         source_mapping=source_mapping,
         assistant_message=state["assistant_message"],
     )
+    parsed_source_ids = _parse_cited_source_ids(state["assistant_message"])
+    used_fallback_citations = len(citations) > 0 and not parsed_source_ids
     return _build_node_result(
         node_name="build_citations",
         started_at=started_at,
@@ -401,6 +424,11 @@ def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
         updates={
             "source_mapping": source_mapping,
             "citations": citations,
+            "used_fallback_citations": used_fallback_citations,
+        },
+        trace_overrides={
+            "cited_count": len(citations),
+            "used_fallback_citations": used_fallback_citations,
         },
     )
 
@@ -574,6 +602,7 @@ def _build_node_result(
     detail: str,
     updates: dict[str, Any] | None = None,
     status: Literal["completed", "skipped"] = "completed",
+    trace_overrides: dict[str, Any] | None = None,
 ) -> AskGraphState:
     result: AskGraphState = {}
     if updates:
@@ -584,6 +613,7 @@ def _build_node_result(
             started_at=started_at,
             detail=detail,
             status=status,
+            **(trace_overrides or {}),
         )
     ]
     return result
@@ -594,12 +624,28 @@ def _build_graph_trace_item(
     started_at: float,
     detail: str,
     status: Literal["completed", "skipped"] = "completed",
+    used_history: bool | None = None,
+    rewritten_question: str | None = None,
+    retrieval_count: int | None = None,
+    top1_score: float | None = None,
+    threshold: float | None = None,
+    decision: Literal["answer", "reject"] | None = None,
+    cited_count: int | None = None,
+    used_fallback_citations: bool | None = None,
 ) -> DebugGraphTraceItem:
     return DebugGraphTraceItem(
         node=node_name,
         status=status,
         duration_ms=_elapsed_ms(started_at),
         detail=detail,
+        used_history=used_history,
+        rewritten_question=rewritten_question,
+        retrieval_count=retrieval_count,
+        top1_score=top1_score,
+        threshold=threshold,
+        decision=decision,
+        cited_count=cited_count,
+        used_fallback_citations=used_fallback_citations,
     )
 
 

@@ -58,6 +58,14 @@ class RagServiceTestCase(unittest.TestCase):
         Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
 
+    @staticmethod
+    def _find_graph_trace_item(graph_trace, node_name):
+        for item in graph_trace:
+            current_node = item["node"] if isinstance(item, dict) else item.node
+            if current_node == node_name:
+                return item
+        raise AssertionError(f"missing graph trace item: {node_name}")
+
     def test_returns_reject_debug_when_no_retrieval_results(self):
         with patch("app.services.rag_service.search_chunks", return_value=[]):
             with patch("app.services.rag_service.generate_answer") as mocked_generate_answer:
@@ -92,6 +100,27 @@ class RagServiceTestCase(unittest.TestCase):
             ],
         )
         self.assertEqual(response.debug.graph_trace[2].status, "skipped")
+        rewrite_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "rewrite_question"
+        )
+        retrieve_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "retrieve_context"
+        )
+        guard_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "relevance_guard"
+        )
+        citations_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "build_citations"
+        )
+        self.assertFalse(rewrite_item.used_history)
+        self.assertEqual(rewrite_item.rewritten_question, "问题")
+        self.assertEqual(retrieve_item.retrieval_count, 0)
+        self.assertIsNone(retrieve_item.top1_score)
+        self.assertEqual(guard_item.decision, "reject")
+        self.assertEqual(guard_item.threshold, 0.35)
+        self.assertIsNone(guard_item.top1_score)
+        self.assertEqual(citations_item.cited_count, 0)
+        self.assertFalse(citations_item.used_fallback_citations)
         self.assertEqual(response.retrieved_chunks, [])
         self.assertIsNotNone(response.conversation_id)
 
@@ -173,6 +202,27 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertGreaterEqual(response.debug.retrieval_ms, 0)
         self.assertGreaterEqual(response.debug.total_ms, 0)
         self.assertTrue(all(item.duration_ms >= 0 for item in response.debug.graph_trace))
+        rewrite_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "rewrite_question"
+        )
+        retrieve_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "retrieve_context"
+        )
+        guard_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "relevance_guard"
+        )
+        citations_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "build_citations"
+        )
+        self.assertFalse(rewrite_item.used_history)
+        self.assertEqual(rewrite_item.rewritten_question, "问题")
+        self.assertEqual(retrieve_item.retrieval_count, 2)
+        self.assertEqual(retrieve_item.top1_score, 0.9)
+        self.assertEqual(guard_item.decision, "answer")
+        self.assertEqual(guard_item.threshold, 0.35)
+        self.assertEqual(guard_item.top1_score, 0.9)
+        self.assertEqual(citations_item.cited_count, 2)
+        self.assertFalse(citations_item.used_fallback_citations)
 
         conversation = self.db.query(Conversation).filter(Conversation.id == response.conversation_id).first()
         self.assertEqual(conversation.title, "问题")
@@ -251,6 +301,11 @@ class RagServiceTestCase(unittest.TestCase):
 
         cited_flags = [item.whether_cited for item in response.debug.retrieved_chunks]
         self.assertEqual(cited_flags, [True, True, True, False])
+        citations_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "build_citations"
+        )
+        self.assertEqual(citations_item.cited_count, 3)
+        self.assertTrue(citations_item.used_fallback_citations)
 
     def test_debug_is_none_when_request_does_not_enable_it(self):
         retrieved = [
@@ -454,8 +509,16 @@ class RagServiceTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(response.debug.final_context_preview)
         self.assertIn("recent_turn_summary", response.debug.final_context_preview)
-        self.assertEqual(response.debug.graph_trace[2].node, "rewrite_question")
-        self.assertEqual(response.debug.graph_trace[2].status, "completed")
+        rewrite_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "rewrite_question"
+        )
+        self.assertEqual(rewrite_item.node, "rewrite_question")
+        self.assertEqual(rewrite_item.status, "completed")
+        self.assertTrue(rewrite_item.used_history)
+        self.assertEqual(
+            rewrite_item.rewritten_question,
+            "请假制度里请假审批需要提前多久提交？",
+        )
 
     def test_stream_events_emit_start_delta_final_and_save_assistant_message(self):
         retrieved = [
@@ -502,6 +565,22 @@ class RagServiceTestCase(unittest.TestCase):
                 "finalize_response",
             ],
         )
+        retrieve_item = self._find_graph_trace_item(
+            events[-1][1]["debug"]["graph_trace"], "retrieve_context"
+        )
+        guard_item = self._find_graph_trace_item(
+            events[-1][1]["debug"]["graph_trace"], "relevance_guard"
+        )
+        citations_item = self._find_graph_trace_item(
+            events[-1][1]["debug"]["graph_trace"], "build_citations"
+        )
+        self.assertEqual(retrieve_item["retrieval_count"], 1)
+        self.assertEqual(retrieve_item["top1_score"], 0.9)
+        self.assertEqual(guard_item["decision"], "answer")
+        self.assertEqual(guard_item["threshold"], 0.35)
+        self.assertEqual(guard_item["top1_score"], 0.9)
+        self.assertEqual(citations_item["cited_count"], 1)
+        self.assertFalse(citations_item["used_fallback_citations"])
         messages = (
             self.db.query(Message)
             .filter(Message.conversation_id == events[-1][1]["conversation_id"])

@@ -1,6 +1,6 @@
 # Backend 运行手册
 
-后端基于 `FastAPI + SQLAlchemy + PostgreSQL + pgvector + Redis + Celery`，负责认证、知识库管理、文档上传、异步建库、检索问答和多轮会话。
+后端基于 `FastAPI + SQLAlchemy + PostgreSQL + pgvector + Redis + Celery`，负责认证、知识库管理、文档上传、异步建库、检索问答、多轮会话和轻量 Agent 任务入口。
 
 ## 目录说明
 
@@ -107,6 +107,8 @@ docker compose up -d db redis
 - 多轮会话：最近消息参与问题改写和回答 Prompt
 - 会话历史与消息列表
 - Chunk 原文预览
+- Agent 任务入口：知识库问答、知识库总结、最新文档汇总、面试材料生成
+- 失败文档手动重试
 
 ## 异步文档处理链路
 

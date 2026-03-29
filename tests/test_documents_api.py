@@ -76,10 +76,19 @@ class DocumentsApiTestCase(unittest.TestCase):
             storage_path=str(deleted_storage_path),
             status="success",
         )
-        self.db.add_all([self.active_document, self.deleted_document])
+        self.failed_document = Document(
+            knowledge_base_id=self.active_kb.id,
+            filename="failed.txt",
+            file_type="txt",
+            storage_path=str(Path(self.temp_dir.name) / "failed.txt"),
+            status="failed",
+            error_message="embedding timeout",
+        )
+        self.db.add_all([self.active_document, self.deleted_document, self.failed_document])
         self.db.commit()
         self.db.refresh(self.active_document)
         self.db.refresh(self.deleted_document)
+        self.db.refresh(self.failed_document)
 
         self.active_chunk = Chunk(
             document_id=self.active_document.id,
@@ -123,8 +132,8 @@ class DocumentsApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(len(payload), 1)
-        self.assertEqual(payload[0]["id"], self.active_document.id)
+        document_ids = {item["id"] for item in payload}
+        self.assertEqual(document_ids, {self.active_document.id, self.failed_document.id})
 
     def test_list_documents_for_deleted_knowledge_base_returns_404(self):
         response = self.client.get(f"/api/documents?knowledge_base_id={self.deleted_kb.id}")
@@ -204,3 +213,23 @@ class DocumentsApiTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(created_document)
         self.assertEqual(created_document.status, "processing")
+
+    def test_retry_failed_document_sets_processing_and_enqueues_task(self):
+        with patch("app.api.documents.enqueue_document_ingestion") as mocked_enqueue:
+            response = self.client.post(f"/api/documents/{self.failed_document.id}/retry")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "processing")
+        self.assertIsNone(payload["error_message"])
+        mocked_enqueue.assert_called_once_with(self.failed_document.id)
+
+        refreshed_document = self.db.get(Document, self.failed_document.id)
+        self.assertEqual(refreshed_document.status, "processing")
+        self.assertIsNone(refreshed_document.error_message)
+
+    def test_retry_non_failed_document_returns_400(self):
+        response = self.client.post(f"/api/documents/{self.active_document.id}/retry")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Only failed documents can be retried")

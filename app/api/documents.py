@@ -104,6 +104,23 @@ def get_document(
     return get_owned_document(db, id, current_user.id)
 
 
+@router.post("/{id}/retry", response_model=DocumentDetailResponse)
+def retry_document_ingestion(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    document = get_owned_document(db, id, current_user.id)
+    if document.status != "failed":
+        raise HTTPException(status_code=400, detail="Only failed documents can be retried")
+
+    # 这里只允许 failed 状态重试，避免对 processing/success 文档重复入队，
+    # 让“人工重试”成为一个明确的故障恢复入口，而不是隐式重复建库。
+    mark_document_processing(db, document)
+    enqueue_document_ingestion(document.id)
+    return document
+
+
 @router.get("/{id}/chunks", response_model=list[ChunkListResponse])
 def list_document_chunks(
     id: int,

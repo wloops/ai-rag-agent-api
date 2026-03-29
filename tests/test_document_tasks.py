@@ -1,4 +1,5 @@
 import unittest
+from importlib import reload
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
@@ -71,3 +72,11 @@ class DocumentTaskTestCase(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(refreshed_document.status, "success")
+
+    def test_document_task_module_imports_model_registry(self):
+        with patch("app.models.knowledge_base.KnowledgeBase", new=None):
+            import app.tasks.document_tasks as document_tasks_module
+
+            reloaded_module = reload(document_tasks_module)
+
+        self.assertIsNotNone(reloaded_module.models.KnowledgeBase)

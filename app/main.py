@@ -13,12 +13,7 @@ from app.api.kb import router as kb_router
 from app.api.retrieval import router as retrieval_router
 from app.core.config import settings
 from app.core.database import Base, engine
-from app.models.chunk import Chunk  # noqa: F401
-from app.models.conversation import Conversation  # noqa: F401
-from app.models.document import Document  # noqa: F401
-from app.models.knowledge_base import KnowledgeBase  # noqa: F401
-from app.models.message import Message  # noqa: F401
-from app.models.user import User  # noqa: F401
+from app import models  # noqa: F401
 
 
 app = FastAPI(title="AI Knowledge Base API")

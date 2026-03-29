@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app import models  # noqa: F401
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -11,6 +12,7 @@ from app.services.document_ingestion import (
     mark_document_processing,
 )
 
+# Worker 进程不会经过 FastAPI 启动入口，这里要显式导入模型包来完成关系映射注册。
 
 def _retry_countdown(retry_count: int) -> int:
     return settings.celery_document_retry_base_seconds * (2 ** retry_count)

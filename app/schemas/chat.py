@@ -42,6 +42,13 @@ class DebugRetrievedChunkItem(BaseModel):
     whether_cited: bool = False
 
 
+class DebugGraphTraceItem(BaseModel):
+    node: str
+    status: Literal["completed", "skipped"]
+    duration_ms: int
+    detail: str
+
+
 class DebugInfo(BaseModel):
     question: str
     knowledge_base_id: int
@@ -55,6 +62,7 @@ class DebugInfo(BaseModel):
     embedding_ms: int | None = None
     final_context_preview: str | None = None
     retrieved_chunks: list[DebugRetrievedChunkItem]
+    graph_trace: list[DebugGraphTraceItem] = Field(default_factory=list)
 
 
 class ChatAskResponse(BaseModel):

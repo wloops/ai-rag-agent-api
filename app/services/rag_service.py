@@ -1,15 +1,20 @@
+import operator
 import re
 from collections.abc import Generator
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import HTTPException
+from langgraph.config import get_stream_writer
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import Annotated, TypedDict
 
 from app.models.conversation import Conversation
 from app.schemas.chat import (
     ChatAskResponse,
     ChatCitationItem,
+    DebugGraphTraceItem,
     DebugInfo,
     DebugRetrievedChunkItem,
     RetrievedChunkDebugItem,
@@ -46,6 +51,35 @@ class AskPreparedContext:
     total_started_at: float
     top1_score: float | None
     decision: Literal["answer", "reject"]
+    graph_trace: list[DebugGraphTraceItem]
+
+
+class AskGraphState(TypedDict, total=False):
+    db: Any
+    current_user_id: int
+    knowledge_base_id: int
+    question: str
+    top_k: int
+    debug: bool
+    conversation_id: int | None
+    total_started_at: float
+    normalized_question: str
+    conversation: Conversation
+    recent_messages: list[object]
+    standalone_question: str
+    recent_turn_summary: str | None
+    retrieval_trace: RetrievalTrace | None
+    retrieved_chunks: list[RetrievalSearchItem]
+    retrieval_ms: int
+    top1_score: float | None
+    decision: Literal["answer", "reject"]
+    assistant_message: str
+    llm_ms: int
+    source_mapping: dict[str, RetrievalSearchItem]
+    final_context_preview: str | None
+    citations: list[ChatCitationItem]
+    response: ChatAskResponse
+    graph_trace: Annotated[list[DebugGraphTraceItem], operator.add]
 
 
 def ask_knowledge_base(
@@ -57,61 +91,21 @@ def ask_knowledge_base(
     debug: bool = False,
     conversation_id: int | None = None,
 ) -> ChatAskResponse:
-    context = _prepare_ask_context(
-        db=db,
-        current_user_id=current_user_id,
-        knowledge_base_id=knowledge_base_id,
-        question=question,
-        top_k=top_k,
-        debug=debug,
-        conversation_id=conversation_id,
-    )
-
-    if context.decision == "reject":
-        return _finalize_response(
+    result = CHAT_ASK_GRAPH.invoke(
+        _build_initial_graph_state(
             db=db,
-            context=context,
-            assistant_message=NO_ANSWER_MESSAGE,
-            citations=[],
-            final_context_preview=None,
-            llm_ms=0,
+            current_user_id=current_user_id,
             knowledge_base_id=knowledge_base_id,
+            question=question,
+            top_k=top_k,
+            debug=debug,
+            conversation_id=conversation_id,
         )
-
-    source_mapping = _build_source_mapping(context.retrieved_chunks)
-    context_blocks = _build_context_blocks(source_mapping)
-    final_context_preview = _build_final_context_preview(
-        standalone_question=context.standalone_question,
-        recent_turn_summary=context.recent_turn_summary,
-        context_blocks=context_blocks,
     )
-
-    llm_started_at = perf_counter()
-    assistant_message = generate_answer(
-        system_prompt=_build_system_prompt(),
-        user_prompt=_build_user_prompt(
-            original_question=context.normalized_question,
-            standalone_question=context.standalone_question,
-            source_mapping=source_mapping,
-            context_blocks=context_blocks,
-            recent_turn_summary=context.recent_turn_summary,
-        ),
-    )
-    llm_ms = _elapsed_ms(llm_started_at)
-    citations = _resolve_citations(
-        retrieved_chunks=context.retrieved_chunks,
-        source_mapping=source_mapping,
-        assistant_message=assistant_message,
-    )
-    return _finalize_response(
-        db=db,
-        context=context,
-        assistant_message=assistant_message,
-        citations=citations,
-        final_context_preview=final_context_preview,
-        llm_ms=llm_ms,
-        knowledge_base_id=knowledge_base_id,
-    )
+    response = result.get("response")
+    if response is None:
+        raise RuntimeError("Chat graph produced no response")
+    return response
 
 
 def stream_knowledge_base_events(
@@ -123,7 +117,7 @@ def stream_knowledge_base_events(
     debug: bool = False,
     conversation_id: int | None = None,
 ) -> Generator[tuple[str, dict], None, None]:
-    context = _prepare_ask_context(
+    state = _build_initial_graph_state(
         db=db,
         current_user_id=current_user_id,
         knowledge_base_id=knowledge_base_id,
@@ -132,140 +126,541 @@ def stream_knowledge_base_events(
         debug=debug,
         conversation_id=conversation_id,
     )
-    yield "start", {"conversation_id": context.conversation.id}
+    state = _merge_graph_state(state, _graph_node_validate_request(state))
+    state = _merge_graph_state(state, _graph_node_resolve_conversation(state))
+    yield "start", {"conversation_id": state["conversation"].id}
+    state = _merge_graph_state(state, _graph_node_rewrite_question(state))
+    state = _merge_graph_state(state, _graph_node_retrieve_context(state))
+    state = _merge_graph_state(state, _graph_node_relevance_guard(state))
 
-    if context.decision == "reject":
-        response = _finalize_response(
-            db=db,
-            context=context,
-            assistant_message=NO_ANSWER_MESSAGE,
-            citations=[],
-            final_context_preview=None,
-            llm_ms=0,
-            knowledge_base_id=knowledge_base_id,
+    if state["decision"] == "answer":
+        started_at = perf_counter()
+        source_mapping = _build_source_mapping(state["retrieved_chunks"])
+        context_blocks = _build_context_blocks(source_mapping)
+        final_context_preview = _build_final_context_preview(
+            standalone_question=state["standalone_question"],
+            recent_turn_summary=state.get("recent_turn_summary"),
+            context_blocks=context_blocks,
         )
-        yield "final", response.model_dump(mode="json")
-        return
-
-    source_mapping = _build_source_mapping(context.retrieved_chunks)
-    context_blocks = _build_context_blocks(source_mapping)
-    final_context_preview = _build_final_context_preview(
-        standalone_question=context.standalone_question,
-        recent_turn_summary=context.recent_turn_summary,
-        context_blocks=context_blocks,
-    )
-
-    llm_started_at = perf_counter()
-    answer_chunks: list[str] = []
-    for delta in stream_answer(
-        system_prompt=_build_system_prompt(),
-        user_prompt=_build_user_prompt(
-            original_question=context.normalized_question,
-            standalone_question=context.standalone_question,
+        user_prompt = _build_user_prompt(
+            original_question=state["normalized_question"],
+            standalone_question=state["standalone_question"],
             source_mapping=source_mapping,
             context_blocks=context_blocks,
-            recent_turn_summary=context.recent_turn_summary,
-        ),
-    ):
-        answer_chunks.append(delta)
-        yield "delta", {"content": delta}
+            recent_turn_summary=state.get("recent_turn_summary"),
+        )
 
-    assistant_message = "".join(answer_chunks).strip()
-    if not assistant_message:
-        raise RuntimeError("LLM returned empty content")
+        llm_started_at = perf_counter()
+        answer_chunks: list[str] = []
+        for delta in stream_answer(
+            system_prompt=_build_system_prompt(),
+            user_prompt=user_prompt,
+        ):
+            answer_chunks.append(delta)
+            yield "delta", {"content": delta}
 
-    llm_ms = _elapsed_ms(llm_started_at)
-    citations = _resolve_citations(
-        retrieved_chunks=context.retrieved_chunks,
-        source_mapping=source_mapping,
-        assistant_message=assistant_message,
-    )
-    response = _finalize_response(
-        db=db,
-        context=context,
-        assistant_message=assistant_message,
-        citations=citations,
-        final_context_preview=final_context_preview,
-        llm_ms=llm_ms,
-        knowledge_base_id=knowledge_base_id,
-    )
+        assistant_message = "".join(answer_chunks).strip()
+        if not assistant_message:
+            raise RuntimeError("LLM returned empty content")
+
+        state = _merge_graph_state(
+            state,
+            _build_node_result(
+                node_name="stream_answer",
+                started_at=started_at,
+                detail=f"Generated answer using {len(source_mapping)} retrieved chunks.",
+                updates={
+                    "assistant_message": assistant_message,
+                    "llm_ms": _elapsed_ms(llm_started_at),
+                    "source_mapping": source_mapping,
+                    "final_context_preview": final_context_preview,
+                },
+            ),
+        )
+
+    state = _merge_graph_state(state, _graph_node_build_citations(state))
+    state = _merge_graph_state(state, _graph_node_finalize_response(state))
+    response = state.get("response")
+    if response is None:
+        raise RuntimeError("Chat stream flow produced no final response")
     yield "final", response.model_dump(mode="json")
 
 
-def _prepare_ask_context(
+def _build_initial_graph_state(
     db,
     current_user_id: int,
     knowledge_base_id: int,
     question: str,
     top_k: int,
     debug: bool,
-    conversation_id: int | None = None,
-) -> AskPreparedContext:
-    total_started_at = perf_counter()
-    normalized_question = question.strip()
+    conversation_id: int | None,
+) -> AskGraphState:
+    return AskGraphState(
+        db=db,
+        current_user_id=current_user_id,
+        knowledge_base_id=knowledge_base_id,
+        question=question,
+        top_k=top_k,
+        debug=debug,
+        conversation_id=conversation_id,
+        total_started_at=perf_counter(),
+        graph_trace=[],
+    )
+
+
+def _graph_node_validate_request(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    normalized_question = state["question"].strip()
     if not normalized_question:
         raise HTTPException(status_code=400, detail="Question cannot be blank")
 
-    get_owned_knowledge_base(db, knowledge_base_id, current_user_id)
-    conversation = resolve_conversation_for_question(
-        db=db,
-        current_user_id=current_user_id,
-        knowledge_base_id=knowledge_base_id,
-        question=normalized_question,
-        conversation_id=conversation_id,
+    get_owned_knowledge_base(
+        state["db"],
+        state["knowledge_base_id"],
+        state["current_user_id"],
+    )
+    return _build_node_result(
+        node_name="validate_request",
+        started_at=started_at,
+        detail=(
+            f"Validated question length {len(normalized_question)} and confirmed "
+            f"knowledge base #{state['knowledge_base_id']} access."
+        ),
+        updates={"normalized_question": normalized_question},
     )
 
+
+def _graph_node_resolve_conversation(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    conversation = resolve_conversation_for_question(
+        db=state["db"],
+        current_user_id=state["current_user_id"],
+        knowledge_base_id=state["knowledge_base_id"],
+        question=state["normalized_question"],
+        conversation_id=state.get("conversation_id"),
+    )
     recent_messages = list_recent_conversation_messages(
-        db=db,
+        db=state["db"],
         conversation_id=conversation.id,
-        current_user_id=current_user_id,
+        current_user_id=state["current_user_id"],
         limit=RECENT_MESSAGE_WINDOW,
     )
-    standalone_question = _rewrite_question_with_history(
-        recent_messages,
-        normalized_question,
-    )
-    recent_turn_summary = _build_recent_turn_summary(recent_messages)
-
     save_message(
-        db=db,
+        db=state["db"],
         conversation=conversation,
         role="user",
-        content=normalized_question,
+        content=state["normalized_question"],
+    )
+    _write_stream_event("start", {"conversation_id": conversation.id})
+    return _build_node_result(
+        node_name="resolve_conversation",
+        started_at=started_at,
+        detail=(
+            f"Resolved conversation #{conversation.id} and loaded "
+            f"{len(recent_messages)} recent messages."
+        ),
+        updates={
+            "conversation": conversation,
+            "recent_messages": recent_messages,
+        },
     )
 
-    retrieval_trace = RetrievalTrace() if debug else None
+
+def _graph_node_rewrite_question(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    recent_messages = state.get("recent_messages", [])
+    standalone_question = _rewrite_question_with_history(
+        recent_messages,
+        state["normalized_question"],
+    )
+    recent_turn_summary = _build_recent_turn_summary(recent_messages)
+    used_history = bool(recent_messages)
+    return _build_node_result(
+        node_name="rewrite_question",
+        started_at=started_at,
+        detail=(
+            "Rewrote the follow-up question using recent history."
+            if used_history
+            else "No recent history found; reused the normalized question."
+        ),
+        status="completed" if used_history else "skipped",
+        updates={
+            "standalone_question": standalone_question,
+            "recent_turn_summary": recent_turn_summary,
+        },
+    )
+
+
+def _graph_node_retrieve_context(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    retrieval_trace = RetrievalTrace() if state["debug"] else None
     retrieval_started_at = perf_counter()
     retrieved_chunks = search_chunks(
-        db=db,
-        current_user_id=current_user_id,
-        knowledge_base_id=knowledge_base_id,
-        query=standalone_question,
-        top_k=top_k,
+        db=state["db"],
+        current_user_id=state["current_user_id"],
+        knowledge_base_id=state["knowledge_base_id"],
+        query=state["standalone_question"],
+        top_k=state["top_k"],
         trace=retrieval_trace,
     )
     retrieval_ms = _elapsed_ms(retrieval_started_at)
     top1_score = retrieved_chunks[0].score if retrieved_chunks else None
+    return _build_node_result(
+        node_name="retrieve_context",
+        started_at=started_at,
+        detail=(
+            f"Retrieved {len(retrieved_chunks)} chunks with top1 score "
+            f"{top1_score:.3f}."
+            if top1_score is not None
+            else "Retrieved 0 chunks."
+        ),
+        updates={
+            "retrieval_trace": retrieval_trace,
+            "retrieved_chunks": retrieved_chunks,
+            "retrieval_ms": retrieval_ms,
+            "top1_score": top1_score,
+        },
+    )
+
+
+def _graph_node_relevance_guard(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    top1_score = state.get("top1_score")
     decision: Literal["answer", "reject"] = (
         "answer"
         if top1_score is not None and top1_score >= RELEVANCE_SCORE_THRESHOLD
         else "reject"
     )
-
-    return AskPreparedContext(
-        conversation=conversation,
-        normalized_question=normalized_question,
-        standalone_question=standalone_question,
-        recent_turn_summary=recent_turn_summary,
-        retrieved_chunks=retrieved_chunks,
-        top_k=top_k,
-        debug=debug,
-        retrieval_trace=retrieval_trace,
-        retrieval_ms=retrieval_ms,
-        total_started_at=total_started_at,
-        top1_score=top1_score,
-        decision=decision,
+    updates: AskGraphState = {"decision": decision}
+    if decision == "reject":
+        updates.update(
+            {
+                "assistant_message": NO_ANSWER_MESSAGE,
+                "llm_ms": 0,
+                "source_mapping": {},
+                "final_context_preview": None,
+            }
+        )
+    detail = (
+        f"Top1 score {top1_score:.3f} passed threshold {RELEVANCE_SCORE_THRESHOLD:.2f}."
+        if decision == "answer"
+        else (
+            f"Top1 score {top1_score:.3f} did not pass threshold "
+            f"{RELEVANCE_SCORE_THRESHOLD:.2f}."
+            if top1_score is not None
+            else "No retrieved chunks passed the relevance guard."
+        )
     )
+    return _build_node_result(
+        node_name="relevance_guard",
+        started_at=started_at,
+        detail=detail,
+        updates=updates,
+    )
+
+
+def _graph_node_generate_answer(state: AskGraphState) -> AskGraphState:
+    return _generate_answer_update(
+        state,
+        node_name="generate_answer",
+        streamer=None,
+    )
+
+
+def _graph_node_stream_answer(state: AskGraphState) -> AskGraphState:
+    return _generate_answer_update(
+        state,
+        node_name="stream_answer",
+        streamer=_stream_llm_answer,
+    )
+
+
+def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    if state["decision"] == "reject":
+        return _build_node_result(
+            node_name="build_citations",
+            started_at=started_at,
+            detail="Skipped citation building because the request was rejected.",
+            status="skipped",
+            updates={"citations": []},
+        )
+
+    source_mapping = state.get("source_mapping") or _build_source_mapping(
+        state["retrieved_chunks"]
+    )
+    citations = _resolve_citations(
+        retrieved_chunks=state["retrieved_chunks"],
+        source_mapping=source_mapping,
+        assistant_message=state["assistant_message"],
+    )
+    return _build_node_result(
+        node_name="build_citations",
+        started_at=started_at,
+        detail=f"Built {len(citations)} citations for the final answer.",
+        updates={
+            "source_mapping": source_mapping,
+            "citations": citations,
+        },
+    )
+
+
+def _graph_node_finalize_response(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    save_message(
+        db=state["db"],
+        conversation=state["conversation"],
+        role="assistant",
+        content=state["assistant_message"],
+        citations_json=[citation.model_dump() for citation in state.get("citations", [])] or None,
+    )
+    trace_item = _build_graph_trace_item(
+        node_name="finalize_response",
+        started_at=started_at,
+        detail=(
+            f"Persisted assistant message for conversation #{state['conversation'].id} "
+            f"with {len(state.get('citations', []))} citations."
+        ),
+    )
+    response = _build_chat_response(
+        state=state,
+        graph_trace=[*state.get("graph_trace", []), trace_item],
+    )
+    return {
+        "response": response,
+        "graph_trace": [trace_item],
+    }
+
+
+def _generate_answer_update(
+    state: AskGraphState,
+    node_name: str,
+    streamer,
+) -> AskGraphState:
+    started_at = perf_counter()
+    source_mapping = _build_source_mapping(state["retrieved_chunks"])
+    context_blocks = _build_context_blocks(source_mapping)
+    final_context_preview = _build_final_context_preview(
+        standalone_question=state["standalone_question"],
+        recent_turn_summary=state.get("recent_turn_summary"),
+        context_blocks=context_blocks,
+    )
+    user_prompt = _build_user_prompt(
+        original_question=state["normalized_question"],
+        standalone_question=state["standalone_question"],
+        source_mapping=source_mapping,
+        context_blocks=context_blocks,
+        recent_turn_summary=state.get("recent_turn_summary"),
+    )
+
+    llm_started_at = perf_counter()
+    if streamer is None:
+        assistant_message = generate_answer(
+            system_prompt=_build_system_prompt(),
+            user_prompt=user_prompt,
+        )
+    else:
+        assistant_message = streamer(
+            system_prompt=_build_system_prompt(),
+            user_prompt=user_prompt,
+        )
+    llm_ms = _elapsed_ms(llm_started_at)
+    return _build_node_result(
+        node_name=node_name,
+        started_at=started_at,
+        detail=f"Generated answer using {len(source_mapping)} retrieved chunks.",
+        updates={
+            "assistant_message": assistant_message,
+            "llm_ms": llm_ms,
+            "source_mapping": source_mapping,
+            "final_context_preview": final_context_preview,
+        },
+    )
+
+
+def _stream_llm_answer(system_prompt: str, user_prompt: str) -> str:
+    return _stream_llm_answer_with_handler(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        delta_handler=lambda delta: _write_stream_event("delta", {"content": delta}),
+    )
+
+
+def _stream_llm_answer_with_handler(
+    system_prompt: str,
+    user_prompt: str,
+    delta_handler,
+) -> str:
+    answer_chunks: list[str] = []
+    for delta in stream_answer(system_prompt=system_prompt, user_prompt=user_prompt):
+        answer_chunks.append(delta)
+        delta_handler(delta)
+
+    assistant_message = "".join(answer_chunks).strip()
+    if not assistant_message:
+        raise RuntimeError("LLM returned empty content")
+    return assistant_message
+
+
+def _build_chat_response(
+    state: AskGraphState,
+    graph_trace: list[DebugGraphTraceItem],
+) -> ChatAskResponse:
+    context = _build_context_from_state(state, graph_trace)
+    cited_chunk_ids = {
+        citation.chunk_id
+        for citation in state.get("citations", [])
+        if citation.chunk_id is not None
+    }
+
+    debug_info = None
+    if context.debug:
+        debug_info = DebugInfo(
+            question=context.normalized_question,
+            knowledge_base_id=state["knowledge_base_id"],
+            top_k=context.top_k,
+            top1_score=context.top1_score,
+            threshold=RELEVANCE_SCORE_THRESHOLD,
+            decision=context.decision,
+            retrieval_ms=context.retrieval_ms,
+            llm_ms=state.get("llm_ms", 0),
+            total_ms=_elapsed_ms(context.total_started_at),
+            embedding_ms=(
+                context.retrieval_trace.embedding_ms
+                if context.retrieval_trace is not None
+                else None
+            ),
+            final_context_preview=state.get("final_context_preview"),
+            retrieved_chunks=_build_detailed_debug_items(
+                context.retrieved_chunks,
+                cited_chunk_ids,
+            ),
+            graph_trace=graph_trace,
+        )
+
+    return ChatAskResponse(
+        conversation_id=context.conversation.id,
+        answer=state["assistant_message"],
+        citations=state.get("citations", []),
+        retrieved_chunks=_build_debug_items(context.retrieved_chunks) if context.debug else None,
+        debug=debug_info,
+    )
+
+
+def _build_context_from_state(
+    state: AskGraphState,
+    graph_trace: list[DebugGraphTraceItem],
+) -> AskPreparedContext:
+    return AskPreparedContext(
+        conversation=state["conversation"],
+        normalized_question=state["normalized_question"],
+        standalone_question=state["standalone_question"],
+        recent_turn_summary=state.get("recent_turn_summary"),
+        retrieved_chunks=state["retrieved_chunks"],
+        top_k=state["top_k"],
+        debug=state["debug"],
+        retrieval_trace=state.get("retrieval_trace"),
+        retrieval_ms=state.get("retrieval_ms", 0),
+        total_started_at=state["total_started_at"],
+        top1_score=state.get("top1_score"),
+        decision=state["decision"],
+        graph_trace=graph_trace,
+    )
+
+
+def _build_node_result(
+    node_name: str,
+    started_at: float,
+    detail: str,
+    updates: dict[str, Any] | None = None,
+    status: Literal["completed", "skipped"] = "completed",
+) -> AskGraphState:
+    result: AskGraphState = {}
+    if updates:
+        result.update(updates)
+    result["graph_trace"] = [
+        _build_graph_trace_item(
+            node_name=node_name,
+            started_at=started_at,
+            detail=detail,
+            status=status,
+        )
+    ]
+    return result
+
+
+def _build_graph_trace_item(
+    node_name: str,
+    started_at: float,
+    detail: str,
+    status: Literal["completed", "skipped"] = "completed",
+) -> DebugGraphTraceItem:
+    return DebugGraphTraceItem(
+        node=node_name,
+        status=status,
+        duration_ms=_elapsed_ms(started_at),
+        detail=detail,
+    )
+
+
+def _write_stream_event(event_name: str, payload: dict[str, Any]) -> None:
+    try:
+        writer = get_stream_writer()
+    except Exception:
+        return
+    writer({"event": event_name, "payload": payload})
+
+
+def _merge_graph_state(
+    state: AskGraphState,
+    updates: AskGraphState,
+) -> AskGraphState:
+    merged = dict(state)
+    for key, value in updates.items():
+        if key == "graph_trace":
+            merged["graph_trace"] = [*merged.get("graph_trace", []), *value]
+            continue
+        merged[key] = value
+    return merged
+
+
+def _route_after_relevance_guard(answer_node_name: str):
+    def _route(state: AskGraphState) -> str:
+        if state["decision"] == "answer":
+            return answer_node_name
+        return "build_citations"
+
+    return _route
+
+
+def _build_chat_graph(answer_node_name: str, answer_node):
+    builder = StateGraph(AskGraphState)
+    builder.add_node("validate_request", _graph_node_validate_request)
+    builder.add_node("resolve_conversation", _graph_node_resolve_conversation)
+    builder.add_node("rewrite_question", _graph_node_rewrite_question)
+    builder.add_node("retrieve_context", _graph_node_retrieve_context)
+    builder.add_node("relevance_guard", _graph_node_relevance_guard)
+    builder.add_node(answer_node_name, answer_node)
+    builder.add_node("build_citations", _graph_node_build_citations)
+    builder.add_node("finalize_response", _graph_node_finalize_response)
+
+    builder.add_edge(START, "validate_request")
+    builder.add_edge("validate_request", "resolve_conversation")
+    builder.add_edge("resolve_conversation", "rewrite_question")
+    builder.add_edge("rewrite_question", "retrieve_context")
+    builder.add_edge("retrieve_context", "relevance_guard")
+    builder.add_conditional_edges(
+        "relevance_guard",
+        _route_after_relevance_guard(answer_node_name),
+        {
+            answer_node_name: answer_node_name,
+            "build_citations": "build_citations",
+        },
+    )
+    builder.add_edge(answer_node_name, "build_citations")
+    builder.add_edge("build_citations", "finalize_response")
+    builder.add_edge("finalize_response", END)
+    return builder.compile()
 
 
 def _build_system_prompt() -> str:
@@ -418,59 +813,6 @@ def _build_detailed_debug_items(
     ]
 
 
-def _finalize_response(
-    db,
-    context: AskPreparedContext,
-    assistant_message: str,
-    citations: list[ChatCitationItem],
-    final_context_preview: str | None,
-    llm_ms: int,
-    knowledge_base_id: int,
-) -> ChatAskResponse:
-    save_message(
-        db=db,
-        conversation=context.conversation,
-        role="assistant",
-        content=assistant_message,
-        citations_json=[citation.model_dump() for citation in citations] or None,
-    )
-
-    cited_chunk_ids = {
-        citation.chunk_id for citation in citations if citation.chunk_id is not None
-    }
-    debug_info = None
-    if context.debug:
-        debug_info = DebugInfo(
-            question=context.normalized_question,
-            knowledge_base_id=knowledge_base_id,
-            top_k=context.top_k,
-            top1_score=context.top1_score,
-            threshold=RELEVANCE_SCORE_THRESHOLD,
-            decision=context.decision,
-            retrieval_ms=context.retrieval_ms,
-            llm_ms=llm_ms,
-            total_ms=_elapsed_ms(context.total_started_at),
-            embedding_ms=(
-                context.retrieval_trace.embedding_ms
-                if context.retrieval_trace is not None
-                else None
-            ),
-            final_context_preview=final_context_preview,
-            retrieved_chunks=_build_detailed_debug_items(
-                context.retrieved_chunks,
-                cited_chunk_ids,
-            ),
-        )
-
-    return ChatAskResponse(
-        conversation_id=context.conversation.id,
-        answer=assistant_message,
-        citations=citations,
-        retrieved_chunks=_build_debug_items(context.retrieved_chunks) if context.debug else None,
-        debug=debug_info,
-    )
-
-
 def _rewrite_question_with_history(recent_messages: list[object], question: str) -> str:
     if not recent_messages:
         return question
@@ -525,3 +867,6 @@ def _build_snippet(content: str, max_length: int = 120) -> str:
 
 def _elapsed_ms(started_at: float) -> int:
     return int(round((perf_counter() - started_at) * 1000))
+
+
+CHAT_ASK_GRAPH = _build_chat_graph("generate_answer", _graph_node_generate_answer)

@@ -79,6 +79,19 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertEqual(response.debug.llm_ms, 0)
         self.assertIsNone(response.debug.final_context_preview)
         self.assertEqual(response.debug.retrieved_chunks, [])
+        self.assertEqual(
+            [item.node for item in response.debug.graph_trace],
+            [
+                "validate_request",
+                "resolve_conversation",
+                "rewrite_question",
+                "retrieve_context",
+                "relevance_guard",
+                "build_citations",
+                "finalize_response",
+            ],
+        )
+        self.assertEqual(response.debug.graph_trace[2].status, "skipped")
         self.assertEqual(response.retrieved_chunks, [])
         self.assertIsNotNone(response.conversation_id)
 
@@ -141,11 +154,25 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertEqual(response.debug.threshold, 0.35)
         self.assertIsNotNone(response.debug.final_context_preview)
         self.assertEqual(len(response.debug.retrieved_chunks), 2)
+        self.assertEqual(
+            [item.node for item in response.debug.graph_trace],
+            [
+                "validate_request",
+                "resolve_conversation",
+                "rewrite_question",
+                "retrieve_context",
+                "relevance_guard",
+                "generate_answer",
+                "build_citations",
+                "finalize_response",
+            ],
+        )
         self.assertTrue(response.debug.retrieved_chunks[0].whether_cited)
         self.assertTrue(response.debug.retrieved_chunks[1].whether_cited)
         self.assertGreaterEqual(response.debug.llm_ms, 0)
         self.assertGreaterEqual(response.debug.retrieval_ms, 0)
         self.assertGreaterEqual(response.debug.total_ms, 0)
+        self.assertTrue(all(item.duration_ms >= 0 for item in response.debug.graph_trace))
 
         conversation = self.db.query(Conversation).filter(Conversation.id == response.conversation_id).first()
         self.assertEqual(conversation.title, "问题")
@@ -427,6 +454,8 @@ class RagServiceTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(response.debug.final_context_preview)
         self.assertIn("recent_turn_summary", response.debug.final_context_preview)
+        self.assertEqual(response.debug.graph_trace[2].node, "rewrite_question")
+        self.assertEqual(response.debug.graph_trace[2].status, "completed")
 
     def test_stream_events_emit_start_delta_final_and_save_assistant_message(self):
         retrieved = [
@@ -456,10 +485,23 @@ class RagServiceTestCase(unittest.TestCase):
                         top_k=3,
                         debug=True,
                     )
-                )
+        )
 
         self.assertEqual([name for name, _ in events], ["start", "delta", "delta", "final"])
         self.assertEqual(events[-1][1]["answer"], "绛旀 [S1]")
+        self.assertEqual(
+            [item["node"] for item in events[-1][1]["debug"]["graph_trace"]],
+            [
+                "validate_request",
+                "resolve_conversation",
+                "rewrite_question",
+                "retrieve_context",
+                "relevance_guard",
+                "stream_answer",
+                "build_citations",
+                "finalize_response",
+            ],
+        )
         messages = (
             self.db.query(Message)
             .filter(Message.conversation_id == events[-1][1]["conversation_id"])

@@ -51,6 +51,8 @@ def mark_document_processing(db: Session, document: Document) -> Document:
 
 
 def mark_document_failed(db: Session, document: Document, exc: Exception) -> Document:
+    # 文档入库失败往往发生在 flush/commit 阶段；先回滚旧事务，避免状态写回再次触发 PendingRollbackError。
+    db.rollback()
     document.status = "failed"
     document.error_message = str(exc)
     db.commit()

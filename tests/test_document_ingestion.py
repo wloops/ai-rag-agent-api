@@ -3,7 +3,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import UploadFile
 from sqlalchemy import create_engine
@@ -14,7 +14,11 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.models.user import User
-from app.services.document_ingestion import ingest_document_file, persist_document_chunks
+from app.services.document_ingestion import (
+    ingest_document_file,
+    mark_document_failed,
+    persist_document_chunks,
+)
 
 
 class DocumentIngestionTestCase(unittest.TestCase):
@@ -195,6 +199,17 @@ class DocumentIngestionTestCase(unittest.TestCase):
         self.assertEqual(self.document.status, "failed")
         self.assertIn("embedding failed", self.document.error_message)
         self.assertEqual(chunks, [])
+
+    def test_mark_document_failed_rolls_back_before_persisting_failure_status(self):
+        db = MagicMock()
+
+        mark_document_failed(db, self.document, RuntimeError("vector dimension mismatch"))
+
+        self.assertEqual(self.document.status, "failed")
+        self.assertEqual(self.document.error_message, "vector dimension mismatch")
+        db.rollback.assert_called_once()
+        db.commit.assert_called_once()
+        db.refresh.assert_called_once_with(self.document)
 
 
 if __name__ == "__main__":

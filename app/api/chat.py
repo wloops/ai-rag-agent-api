@@ -99,8 +99,10 @@ def ask_chat_stream(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            # 显式禁止中间层压缩/改写 SSE，降低线上代理把分片攒到最后才下发的概率。
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
+            "Pragma": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )

@@ -125,6 +125,9 @@ class ChatApiTestCase(unittest.TestCase):
         self.assertIn("event: delta", payload)
         self.assertIn("event: final", payload)
         self.assertIn('"conversation_id": 10', payload)
+        self.assertEqual(response.headers["cache-control"], "no-cache, no-transform")
+        self.assertEqual(response.headers["pragma"], "no-cache")
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
 
     def test_chat_ask_stream_returns_error_event_when_service_fails(self):
         with patch(

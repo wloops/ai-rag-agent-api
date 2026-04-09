@@ -19,6 +19,7 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     metadata_json: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(settings.embedding_dimensions).with_variant(JSON, "sqlite"),
         nullable=True,

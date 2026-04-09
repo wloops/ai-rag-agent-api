@@ -49,6 +49,14 @@ def _run_postgresql_schema_compatibility() -> None:
         connection.execute(
             text(
                 """
+                ALTER TABLE chunks
+                ADD COLUMN IF NOT EXISTS token_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_bases_user_id_name_active
                 ON knowledge_bases (user_id, name)
                 WHERE deleted_at IS NULL

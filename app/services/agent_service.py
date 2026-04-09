@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.config import settings
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.schemas.agent import AgentRunResponse, AgentTaskType, AgentWorkflowTraceItem
@@ -13,7 +14,7 @@ from app.services.retrieval import search_chunks
 from app.utils.llm_client import generate_answer
 
 DEFAULT_AGENT_TOP_K = 5
-AGENT_RELEVANCE_SCORE_THRESHOLD = 0.35
+AGENT_RELEVANCE_SCORE_THRESHOLD = settings.retrieval_relevance_threshold
 EMPTY_KNOWLEDGE_BASE_MESSAGE = "当前知识库中还没有可用于执行该任务的内容。"
 LOW_RELEVANCE_MESSAGE = "当前知识库中未找到足够相关内容，暂时无法稳定完成该任务。"
 
@@ -50,8 +51,6 @@ def run_agent_task(
         ],
     )
 
-    # latest_documents_digest 更像“列文档 + 摘要”任务，
-    # 直接走文档清单比先做语义检索更稳定，也更符合用户预期。
     if task_type == "latest_documents_digest":
         return _run_latest_documents_digest(db, knowledge_base_id, context)
 
@@ -76,7 +75,7 @@ def run_agent_task(
             AgentWorkflowTraceItem(
                 step="generate_answer",
                 status="skipped",
-                detail="没有召回到任何有效片段，直接返回空知识库提示。",
+                detail="没有召回到有效片段，直接返回空知识库提示。",
             )
         )
         return AgentRunResponse(
@@ -87,17 +86,17 @@ def run_agent_task(
             workflow_trace=context.workflow_trace,
         )
 
-    top1_score = retrieved_chunks[0].score
-    if top1_score < AGENT_RELEVANCE_SCORE_THRESHOLD:
-        # 总结类和材料生成类任务比普通问答更容易“编得像对的”，
-        # 所以这里保留一个明确阈值，低相关时宁可保守返回，也不输出伪结论。
+    top1_score = _resolve_agent_top1_score(retrieved_chunks)
+    if top1_score is None or top1_score < AGENT_RELEVANCE_SCORE_THRESHOLD:
         context.workflow_trace.append(
             AgentWorkflowTraceItem(
                 step="relevance_guard",
                 status="completed",
                 detail=(
-                    f"最高相关度为 {top1_score:.3f}，低于阈值 "
-                    f"{AGENT_RELEVANCE_SCORE_THRESHOLD:.2f}，触发稳妥拒答。"
+                    f"最高相关度 {top1_score:.3f} 低于阈值 {AGENT_RELEVANCE_SCORE_THRESHOLD:.2f}，"
+                    "触发保守拒答。"
+                    if top1_score is not None
+                    else "候选片段缺少稳定相关度信号，触发保守拒答。"
                 ),
             )
         )
@@ -105,7 +104,7 @@ def run_agent_task(
             AgentWorkflowTraceItem(
                 step="generate_answer",
                 status="skipped",
-                detail="为避免输出低质量总结或面试材料，本次未调用大模型生成最终结果。",
+                detail="为避免输出低质量总结或材料，本次未调用大模型生成最终结果。",
             )
         )
         return AgentRunResponse(
@@ -207,33 +206,19 @@ def _resolve_search_query(task_type: AgentTaskType, query: str | None) -> str:
             raise ValueError("Question is required for knowledge_base_qa")
         return query
 
-    # 非问答类任务也统一落到检索链路上，但需要给一个默认任务意图，
-    # 这样前端不填补充要求时，后端仍然能产出稳定结果。
     defaults = {
-        "knowledge_base_summary": (
-            "请总结这个知识库的核心主题、业务价值、产品结构、技术亮点与适合面试时讲述的重点。"
-        ),
-        "interview_material": (
-            "请提炼这个知识库里最适合面试表达的公司背景、产品能力、岗位要求映射、技术关键词与风险提示。"
-        ),
+        "knowledge_base_summary": "请总结这个知识库的核心主题、业务价值、产品结构、技术亮点与适合面试时讲述的重点。",
+        "interview_material": "请提炼这个知识库里最适合面试表达的公司背景、产品能力、岗位要求映射、技术关键词与风险提示。",
     }
     return query or defaults[task_type]
 
 
 def _build_agent_system_prompt(task_type: AgentTaskType) -> str:
     prompts = {
-        "knowledge_base_qa": (
-            "你是知识库 Agent。你只能基于给定上下文回答，回答尽量结构化，无法确认时明确说明不确定。"
-        ),
-        "knowledge_base_summary": (
-            "你是知识库总结 Agent。请提炼业务背景、产品能力、技术结构和可用于面试表达的亮点，避免空泛描述。"
-        ),
-        "latest_documents_digest": (
-            "你是最新文档汇总 Agent。请用简洁结构总结最近文档的主题、价值和可追问方向。"
-        ),
-        "interview_material": (
-            "你是面试材料 Agent。请围绕公司、产品、岗位和候选人项目映射，输出适合面试前复习的材料。"
-        ),
+        "knowledge_base_qa": "你是知识库 Agent。你只能基于给定上下文回答，回答尽量结构化，无法确认时明确说明不确定。",
+        "knowledge_base_summary": "你是知识库总结 Agent。请提炼业务背景、产品能力、技术结构和可用于面试表达的亮点，避免空泛描述。",
+        "latest_documents_digest": "你是最新文档汇总 Agent。请用简洁结构总结最近文档的主题、价值和可追问方向。",
+        "interview_material": "你是面试材料 Agent。请围绕公司、产品、岗位和候选人项目映射，输出适合面试前复习的材料。",
     }
     return prompts[task_type]
 
@@ -290,8 +275,6 @@ def _load_latest_document_chunks(db, document_ids: list[int]) -> list[RetrievalS
         if document.id in first_chunk_by_document:
             continue
 
-        # 每份文档只取最前面的代表片段，控制 prompt 体积，
-        # 避免“最新文档汇总”任务被单份长文档吞掉上下文预算。
         start_offset, end_offset = get_chunk_offsets(chunk)
         first_chunk_by_document[document.id] = RetrievalSearchItem(
             chunk_id=chunk.id,
@@ -302,6 +285,8 @@ def _load_latest_document_chunks(db, document_ids: list[int]) -> list[RetrievalS
             end_offset=end_offset,
             content=chunk.content,
             score=1.0,
+            guard_score=1.0,
+            source_channels=["latest"],
         )
 
     ordered_items: list[RetrievalSearchItem] = []
@@ -360,3 +345,12 @@ def _build_snippet(content: str, max_length: int = 140) -> str:
     if len(normalized_content) <= max_length:
         return normalized_content
     return normalized_content[:max_length].rstrip() + "..."
+
+
+def _resolve_agent_top1_score(retrieved_chunks: list[RetrievalSearchItem]) -> float | None:
+    if not retrieved_chunks:
+        return None
+    top_candidate = retrieved_chunks[0]
+    if top_candidate.guard_score is not None:
+        return top_candidate.guard_score
+    return top_candidate.score

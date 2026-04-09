@@ -10,6 +10,7 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
 from app.models.user import User
 from app.schemas.retrieval import RetrievalSearchItem
+from app.services.retrieval import RetrievalPipelineResult, RetrievalTrace
 from app.services.rag_service import (
     NO_ANSWER_MESSAGE,
     ask_knowledge_base,
@@ -66,8 +67,42 @@ class RagServiceTestCase(unittest.TestCase):
                 return item
         raise AssertionError(f"missing graph trace item: {node_name}")
 
+    @staticmethod
+    def _build_pipeline(
+        final_candidates,
+        *,
+        dense_candidates=None,
+        bm25_candidates=None,
+        fused_candidates=None,
+        rerank_applied=False,
+    ):
+        return RetrievalPipelineResult(
+            dense_candidates=list(
+                dense_candidates if dense_candidates is not None else final_candidates
+            ),
+            bm25_candidates=list(bm25_candidates or []),
+            fused_candidates=list(
+                fused_candidates if fused_candidates is not None else final_candidates
+            ),
+            final_candidates=list(final_candidates),
+            trace=RetrievalTrace(
+                embedding_ms=0,
+                dense_candidates_count=len(
+                    dense_candidates if dense_candidates is not None else final_candidates
+                ),
+                bm25_candidates_count=len(bm25_candidates or []),
+                fusion_candidates_count=len(
+                    fused_candidates if fused_candidates is not None else final_candidates
+                ),
+                rerank_applied=rerank_applied,
+            ),
+        )
+
     def test_returns_reject_debug_when_no_retrieval_results(self):
-        with patch("app.services.rag_service.search_chunks", return_value=[]):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline([]),
+        ):
             with patch("app.services.rag_service.generate_answer") as mocked_generate_answer:
                 response = ask_knowledge_base(
                     db=self.db,
@@ -93,7 +128,10 @@ class RagServiceTestCase(unittest.TestCase):
                 "validate_request",
                 "resolve_conversation",
                 "rewrite_question",
-                "retrieve_context",
+                "retrieve_dense_candidates",
+                "retrieve_bm25_candidates",
+                "fuse_candidates",
+                "rerank_candidates",
                 "relevance_guard",
                 "build_citations",
                 "finalize_response",
@@ -104,7 +142,16 @@ class RagServiceTestCase(unittest.TestCase):
             response.debug.graph_trace, "rewrite_question"
         )
         retrieve_item = self._find_graph_trace_item(
-            response.debug.graph_trace, "retrieve_context"
+            response.debug.graph_trace, "retrieve_dense_candidates"
+        )
+        bm25_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "retrieve_bm25_candidates"
+        )
+        fuse_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "fuse_candidates"
+        )
+        rerank_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "rerank_candidates"
         )
         guard_item = self._find_graph_trace_item(
             response.debug.graph_trace, "relevance_guard"
@@ -115,10 +162,14 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertFalse(rewrite_item.used_history)
         self.assertEqual(rewrite_item.rewritten_question, "问题")
         self.assertEqual(retrieve_item.retrieval_count, 0)
-        self.assertIsNone(retrieve_item.top1_score)
+        self.assertEqual(retrieve_item.dense_candidates_count, 0)
+        self.assertEqual(bm25_item.bm25_candidates_count, 0)
+        self.assertEqual(fuse_item.fusion_candidates_count, 0)
+        self.assertFalse(rerank_item.rerank_applied)
         self.assertEqual(guard_item.decision, "reject")
         self.assertEqual(guard_item.threshold, 0.35)
         self.assertIsNone(guard_item.top1_score)
+        self.assertEqual(guard_item.reject_reason, "no_candidate")
         self.assertEqual(citations_item.cited_count, 0)
         self.assertFalse(citations_item.used_fallback_citations)
         self.assertEqual(response.retrieved_chunks, [])
@@ -157,7 +208,10 @@ class RagServiceTestCase(unittest.TestCase):
             ),
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved, rerank_applied=True),
+        ):
             with patch(
                 "app.services.rag_service.generate_answer",
                 return_value="结论如下 [S1] 进一步说明 [S2]",
@@ -189,7 +243,10 @@ class RagServiceTestCase(unittest.TestCase):
                 "validate_request",
                 "resolve_conversation",
                 "rewrite_question",
-                "retrieve_context",
+                "retrieve_dense_candidates",
+                "retrieve_bm25_candidates",
+                "fuse_candidates",
+                "rerank_candidates",
                 "relevance_guard",
                 "generate_answer",
                 "build_citations",
@@ -206,7 +263,10 @@ class RagServiceTestCase(unittest.TestCase):
             response.debug.graph_trace, "rewrite_question"
         )
         retrieve_item = self._find_graph_trace_item(
-            response.debug.graph_trace, "retrieve_context"
+            response.debug.graph_trace, "retrieve_dense_candidates"
+        )
+        rerank_item = self._find_graph_trace_item(
+            response.debug.graph_trace, "rerank_candidates"
         )
         guard_item = self._find_graph_trace_item(
             response.debug.graph_trace, "relevance_guard"
@@ -217,7 +277,9 @@ class RagServiceTestCase(unittest.TestCase):
         self.assertFalse(rewrite_item.used_history)
         self.assertEqual(rewrite_item.rewritten_question, "问题")
         self.assertEqual(retrieve_item.retrieval_count, 2)
-        self.assertEqual(retrieve_item.top1_score, 0.9)
+        self.assertEqual(retrieve_item.dense_candidates_count, 2)
+        self.assertTrue(rerank_item.rerank_applied)
+        self.assertEqual(rerank_item.top1_score, 0.9)
         self.assertEqual(guard_item.decision, "answer")
         self.assertEqual(guard_item.threshold, 0.35)
         self.assertEqual(guard_item.top1_score, 0.9)
@@ -285,7 +347,10 @@ class RagServiceTestCase(unittest.TestCase):
             ),
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved),
+        ):
             with patch(
                 "app.services.rag_service.generate_answer",
                 return_value="这是没有引用标记的答案",
@@ -321,7 +386,10 @@ class RagServiceTestCase(unittest.TestCase):
             )
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved),
+        ):
             with patch(
                 "app.services.rag_service.generate_answer",
                 return_value="答案 [S1]",
@@ -374,7 +442,10 @@ class RagServiceTestCase(unittest.TestCase):
             )
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved),
+        ):
             with patch(
                 "app.services.rag_service.generate_answer",
                 return_value="答案 [S1]",
@@ -484,8 +555,8 @@ class RagServiceTestCase(unittest.TestCase):
             return_value="请假制度里请假审批需要提前多久提交？",
         ) as mocked_rewrite:
             with patch(
-                "app.services.rag_service.search_chunks",
-                return_value=retrieved,
+                "app.services.rag_service.run_retrieval_pipeline",
+                return_value=self._build_pipeline(retrieved),
             ) as mocked_search:
                 with patch(
                     "app.services.rag_service.generate_answer",
@@ -534,7 +605,10 @@ class RagServiceTestCase(unittest.TestCase):
             )
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved),
+        ):
             with patch(
                 "app.services.rag_service.stream_answer",
                 return_value=iter(["绛旀", " [S1]"]),
@@ -558,7 +632,10 @@ class RagServiceTestCase(unittest.TestCase):
                 "validate_request",
                 "resolve_conversation",
                 "rewrite_question",
-                "retrieve_context",
+                "retrieve_dense_candidates",
+                "retrieve_bm25_candidates",
+                "fuse_candidates",
+                "rerank_candidates",
                 "relevance_guard",
                 "stream_answer",
                 "build_citations",
@@ -566,7 +643,10 @@ class RagServiceTestCase(unittest.TestCase):
             ],
         )
         retrieve_item = self._find_graph_trace_item(
-            events[-1][1]["debug"]["graph_trace"], "retrieve_context"
+            events[-1][1]["debug"]["graph_trace"], "retrieve_dense_candidates"
+        )
+        rerank_item = self._find_graph_trace_item(
+            events[-1][1]["debug"]["graph_trace"], "rerank_candidates"
         )
         guard_item = self._find_graph_trace_item(
             events[-1][1]["debug"]["graph_trace"], "relevance_guard"
@@ -575,7 +655,9 @@ class RagServiceTestCase(unittest.TestCase):
             events[-1][1]["debug"]["graph_trace"], "build_citations"
         )
         self.assertEqual(retrieve_item["retrieval_count"], 1)
-        self.assertEqual(retrieve_item["top1_score"], 0.9)
+        self.assertEqual(retrieve_item["dense_candidates_count"], 1)
+        self.assertFalse(rerank_item["rerank_applied"])
+        self.assertEqual(rerank_item["top1_score"], 0.9)
         self.assertEqual(guard_item["decision"], "answer")
         self.assertEqual(guard_item["threshold"], 0.35)
         self.assertEqual(guard_item["top1_score"], 0.9)
@@ -604,7 +686,10 @@ class RagServiceTestCase(unittest.TestCase):
             )
         ]
 
-        with patch("app.services.rag_service.search_chunks", return_value=retrieved):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved),
+        ):
             with patch(
                 "app.services.rag_service.stream_answer",
                 side_effect=RuntimeError("llm unavailable"),
@@ -623,3 +708,152 @@ class RagServiceTestCase(unittest.TestCase):
 
         messages = self.db.query(Message).order_by(Message.id.asc()).all()
         self.assertEqual([message.role for message in messages], ["user"])
+
+    def test_debug_items_include_extended_retrieval_fields(self):
+        retrieved = [
+            RetrievalSearchItem(
+                chunk_id=1,
+                document_id=1,
+                filename="demo.txt",
+                chunk_index=0,
+                start_offset=0,
+                end_offset=6,
+                content="扩展字段片段",
+                score=0.91,
+                guard_score=0.88,
+                source_channels=["dense", "bm25", "rerank"],
+                dense_score=0.77,
+                bm25_score=6.3,
+                fusion_score=0.52,
+                rerank_score=0.97,
+                dense_rank=2,
+                bm25_rank=1,
+                fusion_rank=1,
+                rerank_rank=1,
+            )
+        ]
+
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved, rerank_applied=True),
+        ):
+            with patch(
+                "app.services.rag_service.generate_answer",
+                return_value="扩展字段答案 [S1]",
+            ):
+                response = ask_knowledge_base(
+                    db=self.db,
+                    current_user_id=self.user_id,
+                    knowledge_base_id=self.knowledge_base_id,
+                    question="测试扩展字段",
+                    top_k=3,
+                    debug=True,
+                )
+
+        top_level_item = response.retrieved_chunks[0]
+        debug_item = response.debug.retrieved_chunks[0]
+        self.assertEqual(top_level_item.guard_score, 0.88)
+        self.assertEqual(top_level_item.source_channels, ["dense", "bm25", "rerank"])
+        self.assertEqual(top_level_item.dense_score, 0.77)
+        self.assertEqual(top_level_item.bm25_score, 6.3)
+        self.assertEqual(top_level_item.fusion_score, 0.52)
+        self.assertEqual(top_level_item.rerank_score, 0.97)
+        self.assertEqual(top_level_item.dense_rank, 2)
+        self.assertEqual(top_level_item.bm25_rank, 1)
+        self.assertEqual(top_level_item.fusion_rank, 1)
+        self.assertEqual(top_level_item.rerank_rank, 1)
+        self.assertEqual(debug_item.guard_score, 0.88)
+        self.assertEqual(debug_item.source_channels, ["dense", "bm25", "rerank"])
+        self.assertEqual(debug_item.dense_score, 0.77)
+        self.assertEqual(debug_item.bm25_score, 6.3)
+        self.assertEqual(debug_item.fusion_score, 0.52)
+        self.assertEqual(debug_item.rerank_score, 0.97)
+        self.assertEqual(debug_item.dense_rank, 2)
+        self.assertEqual(debug_item.bm25_rank, 1)
+        self.assertEqual(debug_item.fusion_rank, 1)
+        self.assertEqual(debug_item.rerank_rank, 1)
+
+    def test_reject_response_uses_fixed_no_answer_message(self):
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline([]),
+        ):
+            response = ask_knowledge_base(
+                db=self.db,
+                current_user_id=self.user_id,
+                knowledge_base_id=self.knowledge_base_id,
+                question="没有命中",
+                top_k=3,
+                debug=True,
+            )
+
+        self.assertEqual(NO_ANSWER_MESSAGE, "当前知识库中未找到足够相关内容。")
+        self.assertEqual(response.answer, "当前知识库中未找到足够相关内容。")
+        messages = (
+            self.db.query(Message)
+            .filter(Message.conversation_id == response.conversation_id)
+            .order_by(Message.id.asc())
+            .all()
+        )
+        self.assertEqual(messages[-1].content, "当前知识库中未找到足够相关内容。")
+
+    def test_stream_and_non_stream_share_graph_sequence(self):
+        retrieved = [
+            RetrievalSearchItem(
+                chunk_id=1,
+                document_id=1,
+                filename="demo.txt",
+                chunk_index=0,
+                start_offset=0,
+                end_offset=6,
+                content="同一条链路",
+                score=0.9,
+                guard_score=0.9,
+            )
+        ]
+
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved, rerank_applied=True),
+        ):
+            with patch(
+                "app.services.rag_service.generate_answer",
+                return_value="同步答案 [S1]",
+            ):
+                response = ask_knowledge_base(
+                    db=self.db,
+                    current_user_id=self.user_id,
+                    knowledge_base_id=self.knowledge_base_id,
+                    question="同步测试",
+                    top_k=3,
+                    debug=True,
+                )
+
+        with patch(
+            "app.services.rag_service.run_retrieval_pipeline",
+            return_value=self._build_pipeline(retrieved, rerank_applied=True),
+        ):
+            with patch(
+                "app.services.rag_service.stream_answer",
+                return_value=iter(["同步答案", " [S1]"]),
+            ):
+                events = list(
+                    stream_knowledge_base_events(
+                        db=self.db,
+                        current_user_id=self.user_id,
+                        knowledge_base_id=self.knowledge_base_id,
+                        question="同步测试",
+                        top_k=3,
+                        debug=True,
+                    )
+                )
+
+        non_stream_nodes = [item.node for item in response.debug.graph_trace]
+        stream_nodes = [item["node"] for item in events[-1][1]["debug"]["graph_trace"]]
+        normalized_non_stream = [
+            "answer" if node == "generate_answer" else node for node in non_stream_nodes
+        ]
+        normalized_stream = [
+            "answer" if node == "stream_answer" else node for node in stream_nodes
+        ]
+        self.assertEqual(normalized_non_stream, normalized_stream)

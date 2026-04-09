@@ -10,6 +10,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import Annotated, TypedDict
 
+from app.core.config import settings
 from app.models.conversation import Conversation
 from app.schemas.chat import (
     ChatAskResponse,
@@ -26,10 +27,14 @@ from app.services.conversation_service import (
     resolve_conversation_for_question,
     save_message,
 )
-from app.services.retrieval import RetrievalTrace, search_chunks
+from app.services.retrieval import (
+    RetrievalPipelineResult,
+    RetrievalTrace,
+    run_retrieval_pipeline,
+)
 from app.utils.llm_client import generate_answer, rewrite_question, stream_answer
 
-RELEVANCE_SCORE_THRESHOLD = 0.35
+RELEVANCE_SCORE_THRESHOLD = settings.retrieval_relevance_threshold
 FINAL_CONTEXT_PREVIEW_MAX_LENGTH = 2000
 RECENT_MESSAGE_WINDOW = 6
 RECENT_TURN_SUMMARY_MESSAGES = 4
@@ -51,6 +56,7 @@ class AskPreparedContext:
     total_started_at: float
     top1_score: float | None
     decision: Literal["answer", "reject"]
+    reject_reason: Literal["no_candidate", "low_confidence"] | None
     graph_trace: list[DebugGraphTraceItem]
 
 
@@ -69,10 +75,12 @@ class AskGraphState(TypedDict, total=False):
     standalone_question: str
     recent_turn_summary: str | None
     retrieval_trace: RetrievalTrace | None
+    retrieval_pipeline: RetrievalPipelineResult | None
     retrieved_chunks: list[RetrievalSearchItem]
     retrieval_ms: int
     top1_score: float | None
     decision: Literal["answer", "reject"]
+    reject_reason: Literal["no_candidate", "low_confidence"] | None
     assistant_message: str
     llm_ms: int
     source_mapping: dict[str, RetrievalSearchItem]
@@ -131,7 +139,10 @@ def stream_knowledge_base_events(
     state = _merge_graph_state(state, _graph_node_resolve_conversation(state))
     yield "start", {"conversation_id": state["conversation"].id}
     state = _merge_graph_state(state, _graph_node_rewrite_question(state))
-    state = _merge_graph_state(state, _graph_node_retrieve_context(state))
+    state = _merge_graph_state(state, _graph_node_retrieve_dense_candidates(state))
+    state = _merge_graph_state(state, _graph_node_retrieve_bm25_candidates(state))
+    state = _merge_graph_state(state, _graph_node_fuse_candidates(state))
+    state = _merge_graph_state(state, _graph_node_rerank_candidates(state))
     state = _merge_graph_state(state, _graph_node_relevance_guard(state))
 
     if state["decision"] == "answer":
@@ -169,7 +180,7 @@ def stream_knowledge_base_events(
             _build_node_result(
                 node_name="stream_answer",
                 started_at=started_at,
-                detail=f"Generated answer using {len(source_mapping)} retrieved chunks.",
+                detail=f"基于 {len(source_mapping)} 个候选片段生成流式回答。",
                 updates={
                     "assistant_message": assistant_message,
                     "llm_ms": _elapsed_ms(llm_started_at),
@@ -224,8 +235,8 @@ def _graph_node_validate_request(state: AskGraphState) -> AskGraphState:
         node_name="validate_request",
         started_at=started_at,
         detail=(
-            f"Validated question length {len(normalized_question)} and confirmed "
-            f"knowledge base #{state['knowledge_base_id']} access."
+            f"已校验问题长度 {len(normalized_question)}，并确认知识库 "
+            f"#{state['knowledge_base_id']} 可访问。"
         ),
         updates={"normalized_question": normalized_question},
     )
@@ -257,8 +268,8 @@ def _graph_node_resolve_conversation(state: AskGraphState) -> AskGraphState:
         node_name="resolve_conversation",
         started_at=started_at,
         detail=(
-            f"Resolved conversation #{conversation.id} and loaded "
-            f"{len(recent_messages)} recent messages."
+            f"已定位会话 #{conversation.id}，并加载了 "
+            f"{len(recent_messages)} 条最近消息。"
         ),
         updates={
             "conversation": conversation,
@@ -280,9 +291,9 @@ def _graph_node_rewrite_question(state: AskGraphState) -> AskGraphState:
         node_name="rewrite_question",
         started_at=started_at,
         detail=(
-            "Rewrote the follow-up question using recent history."
+            "已结合最近对话改写追问。"
             if used_history
-            else "No recent history found; reused the normalized question."
+            else "没有可用历史，直接复用当前问题。"
         ),
         status="completed" if used_history else "skipped",
         updates={
@@ -296,11 +307,11 @@ def _graph_node_rewrite_question(state: AskGraphState) -> AskGraphState:
     )
 
 
-def _graph_node_retrieve_context(state: AskGraphState) -> AskGraphState:
+def _graph_node_retrieve_dense_candidates(state: AskGraphState) -> AskGraphState:
     started_at = perf_counter()
     retrieval_trace = RetrievalTrace() if state["debug"] else None
     retrieval_started_at = perf_counter()
-    retrieved_chunks = search_chunks(
+    retrieval_pipeline = run_retrieval_pipeline(
         db=state["db"],
         current_user_id=state["current_user_id"],
         knowledge_base_id=state["knowledge_base_id"],
@@ -309,38 +320,116 @@ def _graph_node_retrieve_context(state: AskGraphState) -> AskGraphState:
         trace=retrieval_trace,
     )
     retrieval_ms = _elapsed_ms(retrieval_started_at)
-    top1_score = retrieved_chunks[0].score if retrieved_chunks else None
+    dense_count = len(retrieval_pipeline.dense_candidates)
     return _build_node_result(
-        node_name="retrieve_context",
+        node_name="retrieve_dense_candidates",
         started_at=started_at,
         detail=(
-            f"Retrieved {len(retrieved_chunks)} chunks with top1 score "
-            f"{top1_score:.3f}."
-            if top1_score is not None
-            else "Retrieved 0 chunks."
+            f"向量召回得到 {dense_count} 个候选。"
+            if dense_count > 0
+            else "向量召回没有返回候选。"
         ),
         updates={
-            "retrieval_trace": retrieval_trace,
-            "retrieved_chunks": retrieved_chunks,
+            "retrieval_trace": retrieval_pipeline.trace,
+            "retrieval_pipeline": retrieval_pipeline,
             "retrieval_ms": retrieval_ms,
+        },
+        trace_overrides={
+            "retrieval_count": dense_count,
+            "dense_candidates_count": dense_count,
+        },
+    )
+
+
+def _graph_node_retrieve_bm25_candidates(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    retrieval_pipeline = state.get("retrieval_pipeline")
+    bm25_count = len(retrieval_pipeline.bm25_candidates) if retrieval_pipeline else 0
+    return _build_node_result(
+        node_name="retrieve_bm25_candidates",
+        started_at=started_at,
+        detail=(
+            f"BM25 召回得到 {bm25_count} 个候选。"
+            if bm25_count > 0
+            else "BM25 召回没有命中候选。"
+        ),
+        status="completed" if bm25_count > 0 else "skipped",
+        trace_overrides={
+            "retrieval_count": bm25_count,
+            "bm25_candidates_count": bm25_count,
+        },
+    )
+
+
+def _graph_node_fuse_candidates(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    retrieval_pipeline = state.get("retrieval_pipeline")
+    fused_count = len(retrieval_pipeline.fused_candidates) if retrieval_pipeline else 0
+    return _build_node_result(
+        node_name="fuse_candidates",
+        started_at=started_at,
+        detail=(
+            f"已用 RRF 融合双路召回，保留 {fused_count} 个候选。"
+            if fused_count > 0
+            else "没有可用于融合的候选。"
+        ),
+        status="completed" if fused_count > 0 else "skipped",
+        trace_overrides={
+            "retrieval_count": fused_count,
+            "fusion_candidates_count": fused_count,
+        },
+    )
+
+
+def _graph_node_rerank_candidates(state: AskGraphState) -> AskGraphState:
+    started_at = perf_counter()
+    retrieval_pipeline = state.get("retrieval_pipeline")
+    retrieved_chunks = retrieval_pipeline.final_candidates if retrieval_pipeline else []
+    top1_score = _resolve_top1_score(retrieved_chunks)
+    rerank_applied = retrieval_pipeline.trace.rerank_applied if retrieval_pipeline else False
+    return _build_node_result(
+        node_name="rerank_candidates",
+        started_at=started_at,
+        detail=(
+            f"已对 {len(retrieved_chunks)} 个候选完成最终排序。"
+            if rerank_applied
+            else (
+                f"未执行 rerank，直接使用融合排序的 {len(retrieved_chunks)} 个候选。"
+                if retrieved_chunks
+                else "最终候选为空。"
+            )
+        ),
+        status="completed" if retrieved_chunks else "skipped",
+        updates={
+            "retrieved_chunks": retrieved_chunks,
             "top1_score": top1_score,
         },
         trace_overrides={
             "retrieval_count": len(retrieved_chunks),
             "top1_score": top1_score,
+            "rerank_applied": rerank_applied,
         },
     )
 
 
 def _graph_node_relevance_guard(state: AskGraphState) -> AskGraphState:
     started_at = perf_counter()
+    retrieved_chunks = state.get("retrieved_chunks", [])
     top1_score = state.get("top1_score")
-    decision: Literal["answer", "reject"] = (
-        "answer"
-        if top1_score is not None and top1_score >= RELEVANCE_SCORE_THRESHOLD
-        else "reject"
-    )
-    updates: AskGraphState = {"decision": decision}
+    if not retrieved_chunks:
+        decision: Literal["answer", "reject"] = "reject"
+        reject_reason: Literal["no_candidate", "low_confidence"] | None = "no_candidate"
+    elif top1_score is None or top1_score < RELEVANCE_SCORE_THRESHOLD:
+        decision = "reject"
+        reject_reason = "low_confidence"
+    else:
+        decision = "answer"
+        reject_reason = None
+
+    updates: AskGraphState = {
+        "decision": decision,
+        "reject_reason": reject_reason,
+    }
     if decision == "reject":
         updates.update(
             {
@@ -350,16 +439,22 @@ def _graph_node_relevance_guard(state: AskGraphState) -> AskGraphState:
                 "final_context_preview": None,
             }
         )
-    detail = (
-        f"Top1 score {top1_score:.3f} passed threshold {RELEVANCE_SCORE_THRESHOLD:.2f}."
-        if decision == "answer"
-        else (
-            f"Top1 score {top1_score:.3f} did not pass threshold "
-            f"{RELEVANCE_SCORE_THRESHOLD:.2f}."
-            if top1_score is not None
-            else "No retrieved chunks passed the relevance guard."
+
+    if decision == "answer":
+        detail = (
+            f"守卫分数 {top1_score:.3f} 通过阈值 "
+            f"{RELEVANCE_SCORE_THRESHOLD:.2f}。"
         )
-    )
+    elif reject_reason == "no_candidate":
+        detail = "没有可用候选，直接触发拒答。"
+    elif top1_score is not None:
+        detail = (
+            f"守卫分数 {top1_score:.3f} 未通过阈值 "
+            f"{RELEVANCE_SCORE_THRESHOLD:.2f}。"
+        )
+    else:
+        detail = "最终候选未提供足够置信度。"
+
     return _build_node_result(
         node_name="relevance_guard",
         started_at=started_at,
@@ -369,6 +464,7 @@ def _graph_node_relevance_guard(state: AskGraphState) -> AskGraphState:
             "top1_score": top1_score,
             "threshold": RELEVANCE_SCORE_THRESHOLD,
             "decision": decision,
+            "reject_reason": reject_reason,
         },
     )
 
@@ -395,7 +491,7 @@ def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
         return _build_node_result(
             node_name="build_citations",
             started_at=started_at,
-            detail="Skipped citation building because the request was rejected.",
+            detail="请求已被拒答，跳过引用构建。",
             status="skipped",
             updates={
                 "citations": [],
@@ -420,7 +516,7 @@ def _graph_node_build_citations(state: AskGraphState) -> AskGraphState:
     return _build_node_result(
         node_name="build_citations",
         started_at=started_at,
-        detail=f"Built {len(citations)} citations for the final answer.",
+        detail=f"已为最终回答构建 {len(citations)} 条引用。",
         updates={
             "source_mapping": source_mapping,
             "citations": citations,
@@ -446,8 +542,8 @@ def _graph_node_finalize_response(state: AskGraphState) -> AskGraphState:
         node_name="finalize_response",
         started_at=started_at,
         detail=(
-            f"Persisted assistant message for conversation #{state['conversation'].id} "
-            f"with {len(state.get('citations', []))} citations."
+            f"已保存会话 #{state['conversation'].id} 的回答，"
+            f"包含 {len(state.get('citations', []))} 条引用。"
         ),
     )
     response = _build_chat_response(
@@ -496,7 +592,7 @@ def _generate_answer_update(
     return _build_node_result(
         node_name=node_name,
         started_at=started_at,
-        detail=f"Generated answer using {len(source_mapping)} retrieved chunks.",
+        detail=f"基于 {len(source_mapping)} 个候选片段生成回答。",
         updates={
             "assistant_message": assistant_message,
             "llm_ms": llm_ms,
@@ -558,6 +654,12 @@ def _build_chat_response(
                 if context.retrieval_trace is not None
                 else None
             ),
+            rerank_enabled=(
+                context.retrieval_trace.rerank_applied
+                if context.retrieval_trace is not None
+                else None
+            ),
+            reject_reason=context.reject_reason,
             final_context_preview=state.get("final_context_preview"),
             retrieved_chunks=_build_detailed_debug_items(
                 context.retrieved_chunks,
@@ -592,6 +694,7 @@ def _build_context_from_state(
         total_started_at=state["total_started_at"],
         top1_score=state.get("top1_score"),
         decision=state["decision"],
+        reject_reason=state.get("reject_reason"),
         graph_trace=graph_trace,
     )
 
@@ -627,9 +730,14 @@ def _build_graph_trace_item(
     used_history: bool | None = None,
     rewritten_question: str | None = None,
     retrieval_count: int | None = None,
+    dense_candidates_count: int | None = None,
+    bm25_candidates_count: int | None = None,
+    fusion_candidates_count: int | None = None,
+    rerank_applied: bool | None = None,
     top1_score: float | None = None,
     threshold: float | None = None,
     decision: Literal["answer", "reject"] | None = None,
+    reject_reason: Literal["no_candidate", "low_confidence"] | None = None,
     cited_count: int | None = None,
     used_fallback_citations: bool | None = None,
 ) -> DebugGraphTraceItem:
@@ -641,9 +749,14 @@ def _build_graph_trace_item(
         used_history=used_history,
         rewritten_question=rewritten_question,
         retrieval_count=retrieval_count,
+        dense_candidates_count=dense_candidates_count,
+        bm25_candidates_count=bm25_candidates_count,
+        fusion_candidates_count=fusion_candidates_count,
+        rerank_applied=rerank_applied,
         top1_score=top1_score,
         threshold=threshold,
         decision=decision,
+        reject_reason=reject_reason,
         cited_count=cited_count,
         used_fallback_citations=used_fallback_citations,
     )
@@ -684,7 +797,10 @@ def _build_chat_graph(answer_node_name: str, answer_node):
     builder.add_node("validate_request", _graph_node_validate_request)
     builder.add_node("resolve_conversation", _graph_node_resolve_conversation)
     builder.add_node("rewrite_question", _graph_node_rewrite_question)
-    builder.add_node("retrieve_context", _graph_node_retrieve_context)
+    builder.add_node("retrieve_dense_candidates", _graph_node_retrieve_dense_candidates)
+    builder.add_node("retrieve_bm25_candidates", _graph_node_retrieve_bm25_candidates)
+    builder.add_node("fuse_candidates", _graph_node_fuse_candidates)
+    builder.add_node("rerank_candidates", _graph_node_rerank_candidates)
     builder.add_node("relevance_guard", _graph_node_relevance_guard)
     builder.add_node(answer_node_name, answer_node)
     builder.add_node("build_citations", _graph_node_build_citations)
@@ -693,8 +809,11 @@ def _build_chat_graph(answer_node_name: str, answer_node):
     builder.add_edge(START, "validate_request")
     builder.add_edge("validate_request", "resolve_conversation")
     builder.add_edge("resolve_conversation", "rewrite_question")
-    builder.add_edge("rewrite_question", "retrieve_context")
-    builder.add_edge("retrieve_context", "relevance_guard")
+    builder.add_edge("rewrite_question", "retrieve_dense_candidates")
+    builder.add_edge("retrieve_dense_candidates", "retrieve_bm25_candidates")
+    builder.add_edge("retrieve_bm25_candidates", "fuse_candidates")
+    builder.add_edge("fuse_candidates", "rerank_candidates")
+    builder.add_edge("rerank_candidates", "relevance_guard")
     builder.add_conditional_edges(
         "relevance_guard",
         _route_after_relevance_guard(answer_node_name),
@@ -834,6 +953,16 @@ def _build_debug_items(
             chunk_index=item.chunk_index,
             content=item.content,
             score=item.score,
+            guard_score=item.guard_score,
+            source_channels=item.source_channels,
+            dense_score=item.dense_score,
+            bm25_score=item.bm25_score,
+            fusion_score=item.fusion_score,
+            rerank_score=item.rerank_score,
+            dense_rank=item.dense_rank,
+            bm25_rank=item.bm25_rank,
+            fusion_rank=item.fusion_rank,
+            rerank_rank=item.rerank_rank,
         )
         for item in retrieved_chunks
     ]
@@ -851,6 +980,16 @@ def _build_detailed_debug_items(
             chunk_index=item.chunk_index,
             snippet=_build_snippet(item.content, max_length=220),
             score=item.score,
+            guard_score=item.guard_score,
+            source_channels=item.source_channels,
+            dense_score=item.dense_score,
+            bm25_score=item.bm25_score,
+            fusion_score=item.fusion_score,
+            rerank_score=item.rerank_score,
+            dense_rank=item.dense_rank,
+            bm25_rank=item.bm25_rank,
+            fusion_rank=item.fusion_rank,
+            rerank_rank=item.rerank_rank,
             start_offset=item.start_offset,
             end_offset=item.end_offset,
             whether_cited=item.chunk_id in cited_chunk_ids,
@@ -909,6 +1048,15 @@ def _build_snippet(content: str, max_length: int = 120) -> str:
     if len(normalized_content) <= max_length:
         return normalized_content
     return normalized_content[:max_length] + "..."
+
+
+def _resolve_top1_score(retrieved_chunks: list[RetrievalSearchItem]) -> float | None:
+    if not retrieved_chunks:
+        return None
+    top_candidate = retrieved_chunks[0]
+    if top_candidate.guard_score is not None:
+        return top_candidate.guard_score
+    return top_candidate.score
 
 
 def _elapsed_ms(started_at: float) -> int:

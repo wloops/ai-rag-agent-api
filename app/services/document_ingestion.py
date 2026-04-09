@@ -4,7 +4,9 @@ from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
+from app.models.chunk_term import ChunkTerm
 from app.models.document import Document
+from app.services.bm25_index import rebuild_document_bm25_index
 from app.utils.embeddings import embed_texts
 from app.utils.file_parser import parse_file
 from app.utils.text_cleaner import clean_text
@@ -153,19 +155,31 @@ def persist_document_chunks_or_raise(
     chunk_contents = [text[start:end] for start, end in chunk_ranges]
     embeddings = _build_embeddings(chunk_contents)
 
-    db.query(Chunk).filter(Chunk.document_id == document.id).delete()
-    db.add_all(
-        _build_chunks(
-            document.id,
-            text,
-            chunk_ranges,
-            embeddings,
-            chunk_size,
-            overlap,
+    existing_chunk_ids = [
+        chunk_id
+        for chunk_id, in db.query(Chunk.id).filter(Chunk.document_id == document.id).all()
+    ]
+    if existing_chunk_ids:
+        db.query(ChunkTerm).filter(ChunkTerm.chunk_id.in_(existing_chunk_ids)).delete(
+            synchronize_session=False
         )
+    db.query(Chunk).filter(Chunk.document_id == document.id).delete(
+        synchronize_session=False
     )
+
+    chunks = _build_chunks(
+        document.id,
+        text,
+        chunk_ranges,
+        embeddings,
+        chunk_size,
+        overlap,
+    )
+    db.add_all(chunks)
+    db.flush()
     document.status = "success"
     document.error_message = None
+    rebuild_document_bm25_index(db, document, chunks=chunks)
     db.commit()
     db.refresh(document)
     return document
@@ -206,6 +220,7 @@ def _build_chunks(
                 document_id=document_id,
                 chunk_index=chunk_index,
                 content=content,
+                token_count=0,
                 metadata_json={
                     "start_char": start,
                     "end_char": end,

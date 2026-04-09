@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "glm-4.5-air"
+    rerank_enabled: bool = False
+    rerank_api_key: str = ""
+    rerank_base_url: str = ""
+    rerank_model: str = ""
+    rerank_top_n: int = 5
+    retrieval_dense_candidate_k: int = 12
+    retrieval_bm25_candidate_k: int = 12
+    retrieval_fusion_candidate_k: int = 16
+    retrieval_final_top_k: int = 5
+    retrieval_relevance_threshold: float = 0.35
     cors_allow_origins: str = "https://rag.restflux.online"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

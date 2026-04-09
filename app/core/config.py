@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     retrieval_fusion_candidate_k: int = 16
     retrieval_final_top_k: int = 5
     retrieval_relevance_threshold: float = 0.35
-    cors_allow_origins: str = "https://rag.restflux.online"
+    cors_allow_origins: str = "https://rag.wlait.com"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -50,7 +50,7 @@ class Settings(BaseSettings):
             for origin in self.cors_allow_origins.split(",")
             if origin.strip()
         ]
-        return origins or ["https://rag.restflux.online"]
+        return origins or ["https://rag.wlait.com"]
 
 
 settings = Settings()

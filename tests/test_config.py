@@ -8,12 +8,12 @@ class SettingsTestCase(unittest.TestCase):
         settings = Settings(
             database_url="sqlite:///test.db",
             secret_key="test-secret",
-            cors_allow_origins="https://rag.restflux.online, https://preview.restflux.online ",
+            cors_allow_origins="https://rag.wlait.com, https://preview.wlait.com ",
         )
 
         self.assertEqual(
             settings.resolved_cors_allow_origins,
-            ["https://rag.restflux.online", "https://preview.restflux.online"],
+            ["https://rag.wlait.com", "https://preview.wlait.com"],
         )
 
     def test_resolved_cors_allow_origins_falls_back_to_default_domain(self):
@@ -25,5 +25,5 @@ class SettingsTestCase(unittest.TestCase):
 
         self.assertEqual(
             settings.resolved_cors_allow_origins,
-            ["https://rag.restflux.online"],
+            ["https://rag.wlait.com"],
         )

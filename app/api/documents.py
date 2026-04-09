@@ -22,7 +22,11 @@ from app.services.document_ingestion import (
     mark_document_processing,
     save_upload_file,
 )
-from app.services.document_service import build_chunk_preview, get_owned_document
+from app.services.document_service import (
+    build_chunk_preview,
+    delete_owned_document,
+    get_owned_document,
+)
 from app.services.knowledge_base_service import get_active_owned_knowledge_base
 from app.tasks.document_tasks import enqueue_document_ingestion
 
@@ -119,6 +123,16 @@ def retry_document_ingestion(
     mark_document_processing(db, document)
     enqueue_document_ingestion(document.id)
     return document
+
+
+@router.delete("/{id}", status_code=204)
+def delete_document(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    delete_owned_document(db, id, current_user.id)
+    return None
 
 
 @router.get("/{id}/chunks", response_model=list[ChunkListResponse])

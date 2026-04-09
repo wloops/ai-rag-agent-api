@@ -4,8 +4,10 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
+from app.models.chunk_term import ChunkTerm
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
+from app.services.bm25_index import rebuild_knowledge_base_bm25_stats
 from app.schemas.chunk import ChunkPreviewResponse
 from app.utils.file_parser import parse_file
 from app.utils.text_cleaner import clean_text
@@ -80,6 +82,35 @@ def build_chunk_preview(
         highlight_start_offset=safe_start - preview_start,
         highlight_end_offset=safe_end - preview_start,
     )
+
+
+def delete_owned_document(db: Session, document_id: int, current_user_id: int) -> None:
+    document = get_owned_document(db, document_id, current_user_id)
+    if document.status in {"pending", "processing"}:
+        # 进行中的文档仍可能被 worker 消费，先阻止删除以避免并发竞态。
+        raise HTTPException(status_code=400, detail="Processing documents cannot be deleted")
+
+    chunk_ids = [
+        chunk_id
+        for chunk_id, in db.query(Chunk.id).filter(Chunk.document_id == document.id).all()
+    ]
+    if chunk_ids:
+        db.query(ChunkTerm).filter(ChunkTerm.chunk_id.in_(chunk_ids)).delete(
+            synchronize_session=False
+        )
+
+    db.query(Chunk).filter(Chunk.document_id == document.id).delete(
+        synchronize_session=False
+    )
+    db.delete(document)
+    rebuild_knowledge_base_bm25_stats(db, document.knowledge_base_id)
+    db.commit()
+
+    # 存储文件丢失不应回滚主流程，数据库删除成功即可认为操作完成。
+    try:
+        Path(document.storage_path).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def get_chunk_offsets(chunk: Chunk) -> tuple[int, int]:

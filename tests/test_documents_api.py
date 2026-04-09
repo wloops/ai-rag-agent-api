@@ -14,8 +14,10 @@ from app.api.documents import router as documents_router
 from app.core.database import Base, get_db
 from app.core.security import get_current_user
 from app.models.chunk import Chunk
+from app.models.chunk_term import ChunkTerm
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
+from app.models.knowledge_base_term_stat import KnowledgeBaseTermStat
 from app.models.user import User
 
 
@@ -109,6 +111,34 @@ class DocumentsApiTestCase(unittest.TestCase):
         self.db.refresh(self.active_chunk)
         self.db.refresh(self.deleted_chunk)
 
+        self.active_chunk_term = ChunkTerm(
+            chunk_id=self.active_chunk.id,
+            knowledge_base_id=self.active_kb.id,
+            term="active",
+            term_freq=1,
+        )
+        self.active_kb_term_stat = KnowledgeBaseTermStat(
+            knowledge_base_id=self.active_kb.id,
+            term="active",
+            doc_freq=1,
+        )
+        self.processing_document = Document(
+            knowledge_base_id=self.active_kb.id,
+            filename="processing.txt",
+            file_type="txt",
+            storage_path=str(Path(self.temp_dir.name) / "processing.txt"),
+            status="processing",
+        )
+        self.db.add_all(
+            [
+                self.active_chunk_term,
+                self.active_kb_term_stat,
+                self.processing_document,
+            ]
+        )
+        self.db.commit()
+        self.db.refresh(self.processing_document)
+
         self.app = FastAPI()
         self.app.include_router(documents_router)
         self.app.dependency_overrides[get_db] = lambda: self.db
@@ -133,7 +163,14 @@ class DocumentsApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         document_ids = {item["id"] for item in payload}
-        self.assertEqual(document_ids, {self.active_document.id, self.failed_document.id})
+        self.assertEqual(
+            document_ids,
+            {
+                self.active_document.id,
+                self.failed_document.id,
+                self.processing_document.id,
+            },
+        )
 
     def test_list_documents_for_deleted_knowledge_base_returns_404(self):
         response = self.client.get(f"/api/documents?knowledge_base_id={self.deleted_kb.id}")
@@ -233,3 +270,30 @@ class DocumentsApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "Only failed documents can be retried")
+
+    def test_delete_document_removes_file_chunks_and_bm25_rows(self):
+        response = self.client.delete(f"/api/documents/{self.active_document.id}")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertIsNone(self.db.get(Document, self.active_document.id))
+        self.assertEqual(
+            self.db.query(Chunk).filter(Chunk.document_id == self.active_document.id).count(),
+            0,
+        )
+        self.assertEqual(
+            self.db.query(ChunkTerm).filter(ChunkTerm.chunk_id == self.active_chunk.id).count(),
+            0,
+        )
+        self.assertEqual(
+            self.db.query(KnowledgeBaseTermStat)
+            .filter(KnowledgeBaseTermStat.knowledge_base_id == self.active_kb.id)
+            .count(),
+            0,
+        )
+        self.assertFalse(Path(self.active_document.storage_path).exists())
+
+    def test_delete_processing_document_returns_400(self):
+        response = self.client.delete(f"/api/documents/{self.processing_document.id}")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Processing documents cannot be deleted")
